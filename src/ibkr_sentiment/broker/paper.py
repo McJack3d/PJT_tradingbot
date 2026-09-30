@@ -86,7 +86,8 @@ class PaperBroker(Broker):
         for sym, (qty, avg_cost) in self._positions.items():
             if qty == 0:
                 continue
-            mark = self._quotes[sym].last if sym in self._quotes else avg_cost
+            quoted = sym in self._quotes
+            mark = self._quotes[sym].last if quoted else avg_cost
             out.append(
                 PositionView(
                     symbol=sym,
@@ -94,6 +95,7 @@ class PaperBroker(Broker):
                     avg_cost=avg_cost,
                     mark_price=mark,
                     unrealized_pnl=(mark - avg_cost) * qty,
+                    mark_source="quote" if quoted else "cost",
                 )
             )
         return out

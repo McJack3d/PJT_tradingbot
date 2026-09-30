@@ -62,6 +62,10 @@ class PositionView:
     avg_cost: Decimal
     mark_price: Decimal
     unrealized_pnl: Decimal
+    # Where mark_price came from: "portfolio" (broker's own mark),
+    # "quote" (live market data), or "cost" (no market price available —
+    # exposure figures for this position are stale).
+    mark_source: str = "portfolio"
 
 
 @dataclass(slots=True)

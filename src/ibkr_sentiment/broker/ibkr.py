@@ -16,6 +16,7 @@ All client-facing methods go through a shared `_Limiter` (see
 from __future__ import annotations
 
 import asyncio
+import math
 from decimal import Decimal
 from typing import Any
 
@@ -37,6 +38,7 @@ from src.ibkr_sentiment.broker.rate_limiter import (
     per_minute,
     per_window,
 )
+from src.logging_setup import log
 
 
 def default_bucket_specs(
@@ -55,6 +57,20 @@ def default_bucket_specs(
 def _to_decimal(x: Any, default: str = "0") -> Decimal:
     if x is None or x == "":
         return Decimal(default)
+    return Decimal(str(x))
+
+
+def _price(x: Any) -> Decimal | None:
+    """A usable price, or None. IB reports missing prices as NaN (which
+    is truthy) or as -1, so plain truthiness checks are wrong."""
+    if x is None or x == "":
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or f <= 0:
+        return None
     return Decimal(str(x))
 
 
@@ -78,6 +94,8 @@ def _status_from_ib(status: str) -> OrderStatus:
 
 
 class IbkrBroker(Broker):
+    # Quote polling: up to 50 polls of 50ms each (overridable in tests).
+    _quote_poll_s: float = 0.05
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -131,6 +149,10 @@ class IbkrBroker(Broker):
                 port=self.port,
                 clientId=self.client_id,
                 readonly=self.readonly,
+                # Subscribes account updates for this account, which is
+                # what populates `ib.portfolio()` marks on multi-account
+                # logins.
+                account=self.account or "",
             ),
             timeout=self.connect_timeout_s,
         )
@@ -173,44 +195,83 @@ class IbkrBroker(Broker):
         )
 
     async def positions(self) -> list[PositionView]:
+        """Open positions marked to market.
+
+        Quantities come from `ib.positions()` (updated on every fill).
+        Marks come from `ib.portfolio()` — IBKR's own mark, the same one
+        behind NetLiquidation — falling back to a live quote, and only
+        then to average cost (flagged via `mark_source="cost"`).
+        """
         assert self._ib is not None
         await self._limiter.acquire("generic")
-        positions = self._ib.positions(self.account or "")
+        account = self.account or ""
+        marks: dict[int, Decimal] = {}
+        for item in self._ib.portfolio(account):
+            mark = _price(item.marketPrice)
+            if mark is not None:
+                marks[item.contract.conId] = mark
         out: list[PositionView] = []
-        for p in positions:
-            sym = p.contract.symbol
+        for p in self._ib.positions(account):
             qty = _to_decimal(p.position)
+            if qty == 0:
+                continue
+            sym = p.contract.symbol
             avg = _to_decimal(p.avgCost)
-            mark = avg  # IBKR computes unrealized server-side; we keep
-            # the cost as a placeholder and let the strategy mark to
-            # whatever quote source it uses.
+            mark = marks.get(p.contract.conId)
+            source = "portfolio"
+            if mark is None:
+                mark = await self._quote_mark(sym)
+                source = "quote"
+            if mark is None:
+                mark, source = avg, "cost"
+                log.warning("ibkr.positions.mark_fallback_to_cost", symbol=sym)
             out.append(
                 PositionView(
                     symbol=sym,
                     qty=qty,
                     avg_cost=avg,
                     mark_price=mark,
-                    unrealized_pnl=Decimal("0"),
+                    unrealized_pnl=(mark - avg) * qty,
+                    mark_source=source,
                 )
             )
         return out
+
+    async def _quote_mark(self, symbol: str) -> Decimal | None:
+        try:
+            q = await self.quote(symbol)
+        except Exception as e:
+            log.warning("ibkr.quote.error", symbol=symbol, error=str(e))
+            return None
+        if q.bid > 0 and q.ask > 0:
+            return (q.bid + q.ask) / 2
+        return q.last if q.last > 0 else None
 
     async def quote(self, symbol: str) -> Quote:
         assert self._ib is not None
         await self._limiter.acquire("market_data")
         contract = self._contract(symbol)
         ticker = self._ib.reqMktData(contract, "", False, False)
-        # Wait for a tick; if the market is closed and no last is
-        # populated, fall back to bid/ask.
-        for _ in range(50):
-            if ticker.last or ticker.bid or ticker.ask:
-                break
-            await asyncio.sleep(0.05)
+        try:
+            # Wait up to ~2.5s for a tick. Outside market hours `last`
+            # may never arrive, so bid/ask or the prior close will do.
+            for _ in range(50):
+                if any(
+                    _price(v) is not None
+                    for v in (ticker.last, ticker.bid, ticker.ask)
+                ):
+                    break
+                await asyncio.sleep(self._quote_poll_s)
+        finally:
+            # Always release the line: each open subscription counts
+            # against the account's market-data line limit.
+            self._ib.cancelMktData(contract)
+        zero = Decimal("0")
         return Quote(
             symbol=symbol,
-            bid=_to_decimal(ticker.bid),
-            ask=_to_decimal(ticker.ask),
-            last=_to_decimal(ticker.last or ticker.close),
+            bid=_price(ticker.bid) or zero,
+            ask=_price(ticker.ask) or zero,
+            last=_price(ticker.last) or _price(ticker.close) or zero,
         )
 
     async def historical_bars(

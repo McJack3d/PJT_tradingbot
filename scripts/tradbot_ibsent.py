@@ -138,7 +138,8 @@ async def cmd_ibsent_status(args, console: Console) -> int:
                     p.symbol,
                     f"[{colour}]{p.qty}[/]",
                     f"${p.avg_cost:,.2f}",
-                    f"${p.mark_price:,.2f}",
+                    f"${p.mark_price:,.2f}"
+                    + (" [yellow](cost — no market price)[/]" if p.mark_source == "cost" else ""),
                     f"${p.unrealized_pnl:,.2f}",
                 )
             console.print(ptable)
