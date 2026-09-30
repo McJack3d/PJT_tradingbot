@@ -27,6 +27,7 @@ from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
     Broker,
+    MarginImpact,
     OpenOrderView,
     OrderRequest,
     OrderResult,
@@ -96,6 +97,20 @@ def _result_from_trade(trade: Any, *, fallback_client_id: str = "") -> OrderResu
     )
 
 
+def _price_or_signed(x: Any) -> Decimal | None:
+    """Parse an OrderState margin string. IB leaves unset values empty or
+    as DBL_MAX; changes may legitimately be negative."""
+    if x is None or x == "":
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or abs(f) >= 1e300:
+        return None
+    return Decimal(str(x))
+
+
 def _shortable_level(ticker: Any) -> Decimal | None:
     """IBKR's shortable indicator (generic tick 46). Newer clients expose
     it as `ticker.shortable`; ib_insync 0.9.x only records it in
@@ -131,6 +146,10 @@ def _status_from_ib(status: str) -> OrderStatus:
 
 
 class ContractError(RuntimeError):
+    pass
+
+
+class FxRateUnavailableError(RuntimeError):
     pass
 
 
@@ -267,20 +286,52 @@ class IbkrBroker(Broker):
     # ---- account / data ---------------------------------------------
 
     async def account_summary(self) -> AccountSummary:
+        """Account values converted to USD, the trading currency.
+
+        IBKR reports NetLiquidation etc. in the account's BASE currency.
+        For a non-USD base (e.g. EUR) they are divided by IBKR's own
+        USD ExchangeRate (base units per USD); without that rate the
+        call fails rather than size positions in the wrong currency."""
         assert self._ib is not None, "broker not connected"
         await self._limiter.acquire("generic")
         rows = await self._ib.accountSummaryAsync(self.account or "")
         by_tag: dict[str, str] = {}
-        currency = "USD"
+        base = "USD"
         for row in rows:
             by_tag[row.tag] = row.value
-            currency = row.currency or currency
+            if row.tag == "NetLiquidation" and row.currency:
+                base = row.currency
+        rate = Decimal("1")
+        if base != "USD":
+            fx = self._usd_rate()
+            if fx is None:
+                raise FxRateUnavailableError(
+                    f"no USD ExchangeRate for {base} base account; refusing to size in {base}"
+                )
+            rate = fx
+        dtr = by_tag.get("DayTradesRemaining")
+        try:
+            day_trades = int(float(dtr)) if dtr not in (None, "") else None
+        except ValueError:
+            day_trades = None
+        if day_trades is not None and day_trades < 0:
+            day_trades = None  # IBKR: -1 = unlimited
         return AccountSummary(
-            net_liquidation=_to_decimal(by_tag.get("NetLiquidation")),
-            available_funds=_to_decimal(by_tag.get("AvailableFunds")),
-            gross_position_value=_to_decimal(by_tag.get("GrossPositionValue")),
-            currency=currency,
+            net_liquidation=_to_decimal(by_tag.get("NetLiquidation")) / rate,
+            available_funds=_to_decimal(by_tag.get("AvailableFunds")) / rate,
+            gross_position_value=_to_decimal(by_tag.get("GrossPositionValue")) / rate,
+            currency="USD",
+            base_currency=base,
+            fx_rate=rate,
+            day_trades_remaining=day_trades,
         )
+
+    def _usd_rate(self) -> Decimal | None:
+        assert self._ib is not None
+        for v in self._ib.accountValues(self.account or ""):
+            if v.tag == "ExchangeRate" and v.currency == "USD":
+                return _price(v.value)
+        return None
 
     async def positions(self) -> list[PositionView]:
         """Open positions marked to market.
@@ -451,17 +502,23 @@ class IbkrBroker(Broker):
         assert self._ib is not None
         self._require_writable("place_order")
         await self._limiter.acquire("orders")
-        ib_insync = self._ib_insync()
         contract = await self._contract(req.symbol)
+        order = self._build_order(req)
+        trade = self._ib.placeOrder(contract, order)
+        self._trades[str(trade.order.orderId)] = trade
+        # Don't block until fill — return current snapshot. The
+        # execution engine follows up with `wait_for_fill`.
+        await asyncio.sleep(0)
+        return _result_from_trade(trade, fallback_client_id=req.client_order_id)
 
+    def _build_order(self, req: OrderRequest):
+        ib_insync = self._ib_insync()
         if req.order_type == OrderType.MARKET:
             order = ib_insync.MarketOrder(req.side.value, float(req.qty))
         elif req.order_type == OrderType.LIMIT:
             if req.limit_price is None:
                 raise ValueError("LIMIT order requires limit_price")
-            order = ib_insync.LimitOrder(
-                req.side.value, float(req.qty), float(req.limit_price)
-            )
+            order = ib_insync.LimitOrder(req.side.value, float(req.qty), float(req.limit_price))
         elif req.order_type == OrderType.TRAIL:
             if req.trail_percent is None:
                 raise ValueError("TRAIL order requires trail_percent")
@@ -473,7 +530,6 @@ class IbkrBroker(Broker):
             )
         else:
             raise ValueError(f"unsupported order type: {req.order_type}")
-
         order.tif = req.tif
         if req.algo:
             order.algoStrategy = req.algo
@@ -482,12 +538,26 @@ class IbkrBroker(Broker):
             # IBKR doesn't take an arbitrary client-order-id like Binance,
             # but we set `orderRef` so the bot's own logs can join back.
             order.orderRef = req.client_order_id
-        trade = self._ib.placeOrder(contract, order)
-        self._trades[str(trade.order.orderId)] = trade
-        # Don't block until fill — return current snapshot. The
-        # execution engine follows up with `wait_for_fill`.
-        await asyncio.sleep(0)
-        return _result_from_trade(trade, fallback_client_id=req.client_order_id)
+        return order
+
+    async def what_if(self, req: OrderRequest) -> MarginImpact | None:
+        """IBKR what-if: margin before/after without placing the order.
+        Values are in the account's base currency."""
+        assert self._ib is not None
+        await self._limiter.acquire("orders")
+        contract = await self._contract(req.symbol)
+        state = await self._ib.whatIfOrderAsync(contract, self._build_order(req))
+        change = _price_or_signed(state.initMarginChange)
+        after = _price_or_signed(state.initMarginAfter)
+        equity = _price_or_signed(state.equityWithLoanAfter)
+        if change is None or after is None or equity is None:
+            return None
+        return MarginImpact(
+            init_margin_change=change,
+            init_margin_after=after,
+            equity_with_loan_after=equity,
+            warning=getattr(state, "warningText", "") or "",
+        )
 
     def _find_trade(self, broker_order_id: str | None):
         assert self._ib is not None

@@ -74,10 +74,29 @@ class PositionView:
 
 @dataclass(slots=True)
 class AccountSummary:
+    """Money fields are in `currency` (USD, the trading currency): a
+    broker with a non-USD base account converts them at `fx_rate`."""
+
     net_liquidation: Decimal
     available_funds: Decimal
     gross_position_value: Decimal
     currency: str = "USD"
+    base_currency: str = "USD"
+    fx_rate: Decimal = Decimal("1")  # base-currency units per 1 USD
+    # FINRA pattern-day-trader budget from the broker; None = not
+    # limited (equity >= $25k, cash account) or unknown.
+    day_trades_remaining: int | None = None
+
+
+@dataclass(slots=True)
+class MarginImpact:
+    """Pre-trade what-if for one order, in the account's base currency.
+    Only ratios between these fields are used, so no FX is needed."""
+
+    init_margin_change: Decimal
+    init_margin_after: Decimal
+    equity_with_loan_after: Decimal
+    warning: str = ""
 
 
 @dataclass(slots=True)
@@ -167,6 +186,11 @@ class Broker(ABC):
     @abstractmethod
     async def open_orders(self) -> list[OpenOrderView]:
         """Every working order on the account, ours or not."""
+
+    @abstractmethod
+    async def what_if(self, req: OrderRequest) -> MarginImpact | None:
+        """Margin impact of `req` without sending it, or None if the
+        broker can't tell."""
 
     @abstractmethod
     async def short_availability(self, symbol: str) -> ShortInfo | None:

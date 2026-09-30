@@ -138,6 +138,13 @@ execution:
   allow_hard_to_borrow: false
   min_shortable_multiple: "2"
   block_shorts_under_ssr: true
+  # With 0 PDT day trades left (IBKR DayTradesRemaining), hold same-day
+  # positions overnight rather than close them.
+  pdt_check_enabled: true
+  # IBKR what-if margin check on risk-increasing orders; keep 10% of
+  # equity-with-loan free.
+  margin_check_enabled: true
+  margin_buffer_pct: "0.10"
 
 tick_seconds: 60
 fill_timeout_s: 30   # cancel any unfilled remainder after this many seconds

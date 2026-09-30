@@ -25,6 +25,13 @@ basket builder) and routes them to the broker. Respects:
     blocked short is dropped BEFORE the gross/net checks so the rest of
     the basket is re-balanced around it; a blocked long->short flip is
     trimmed to just closing the long.
+  * Pattern-day-trader budget — when the broker reports 0 day trades
+    remaining, a trade that would close a position opened today is held
+    overnight instead of flagging the account.
+  * Margin — every risk-increasing order is priced with the broker's
+    what-if first; the batch's cumulative initial margin must stay under
+    (1 - margin_buffer) of equity-with-loan. Skipped in dry_run (read-
+    only sessions can't what-if); an unavailable check blocks the order.
   * `dry_run` mode — orders are logged, never sent.
   * IBKR pacing — the broker's own rate limiter is what we rely on; the
     engine does not double-count.
@@ -49,7 +56,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderStatus,
     OrderType,
 )
-from src.ibkr_sentiment.risk.overlay import RiskOverlay, RiskVerdict
+from src.ibkr_sentiment.risk.overlay import RiskOverlay, RiskVerdict, is_risk_reducing
 from src.ibkr_sentiment.risk.shorting import ShortPolicy, evaluate_short, short_sale_qty
 from src.ibkr_sentiment.signal_engine.dollar_neutral import (
     TargetPosition,
@@ -89,6 +96,9 @@ class ExecutionEngine:
     order_style: str = "limit"  # limit | adaptive | market
     limit_offset_bps: Decimal = Decimal("10")
     short_policy: ShortPolicy = field(default_factory=ShortPolicy)
+    pdt_check: bool = True
+    margin_check: bool = True
+    margin_buffer: Decimal = Decimal("0.10")
 
     async def enforce_account(
         self, account: AccountSummary, result: RunResult
@@ -116,6 +126,7 @@ class ExecutionEngine:
         current_positions: dict[str, Decimal],
         marks: dict[str, Decimal] | None = None,
         betas: dict[str, Decimal] | None = None,
+        opened_today: set[str] | None = None,
     ) -> RunResult:
         """`marks` are current market prices for held symbols; prices
         for symbols in `targets` are derived from the targets
@@ -144,12 +155,25 @@ class ExecutionEngine:
             approved.append(d)
 
         submitted: list[tuple[TargetPosition, OrderResult]] = []
+        margin_used = Decimal("0")  # cumulative init-margin change this batch
         for d in approved:
+            cur = current_positions.get(d.symbol, Decimal("0"))
+            pdt = self._pdt_block(d, cur, account, opened_today or set())
+            if pdt:
+                result.rejected_by_risk.append((d, pdt))
+                continue
             try:
                 req = await self._to_order_request(d)
             except NoQuoteError as e:
                 result.errors.append((d.symbol, str(e)))
                 continue
+            reducing = is_risk_reducing(cur, d.target_qty)
+            if self.margin_check and not self.dry_run and not reducing:
+                why, change = await self._margin_block(req, margin_used)
+                if why:
+                    result.rejected_by_risk.append((d, why))
+                    continue
+                margin_used += change
             if self.dry_run:
                 result.skipped_dry_run.append((d, req))
                 continue
@@ -163,6 +187,43 @@ class ExecutionEngine:
         )
         result.placed.extend(zip((d for d, _ in submitted), finals, strict=True))
         return result
+
+    def _pdt_block(
+        self,
+        d: TargetPosition,
+        cur: Decimal,
+        account: AccountSummary,
+        opened_today: set[str],
+    ) -> str:
+        """Reason to hold `d` overnight under the PDT rule, or ''."""
+        if not self.pdt_check or account.day_trades_remaining != 0:
+            return ""
+        closes = cur != 0 and (cur > 0) != (d.target_qty > 0)
+        if closes and d.symbol in opened_today:
+            return (
+                f"{d.symbol}: closing a position opened today would be a day trade "
+                "with 0 remaining (PDT); holding overnight"
+            )
+        return ""
+
+    async def _margin_block(
+        self, req: OrderRequest, margin_used: Decimal
+    ) -> tuple[str, Decimal]:
+        try:
+            impact = await self.broker.what_if(req)
+        except Exception as e:
+            return f"{req.symbol}: margin what-if failed ({type(e).__name__}: {e})", Decimal("0")
+        if impact is None:
+            return f"{req.symbol}: margin what-if unavailable", Decimal("0")
+        projected = impact.init_margin_after + margin_used
+        limit = impact.equity_with_loan_after * (1 - self.margin_buffer)
+        if projected > limit:
+            return (
+                f"{req.symbol}: initial margin {projected} would exceed "
+                f"{float(1 - self.margin_buffer):.0%} of equity-with-loan {impact.equity_with_loan_after}",
+                Decimal("0"),
+            )
+        return "", impact.init_margin_change
 
     async def _filter_short_sales(
         self,

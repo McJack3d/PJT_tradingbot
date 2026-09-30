@@ -198,6 +198,18 @@ class IbkrSentimentDB:
             )
             await s.commit()
 
+    async def symbols_filled_since(self, since: datetime) -> set[str]:
+        """Symbols with any filled quantity since `since` — used to spot
+        same-day round trips for the PDT rule."""
+        async with self._session() as s:
+            res = await s.execute(
+                select(TradeRow.symbol)
+                .where(TradeRow.placed_at >= since)
+                .where(TradeRow.filled_qty > 0)
+                .distinct()
+            )
+            return set(res.scalars().all())
+
     async def open_trades(self) -> list[TradeRow]:
         """Trades whose last recorded status was not terminal — i.e. the
         bot stopped before learning how they ended."""

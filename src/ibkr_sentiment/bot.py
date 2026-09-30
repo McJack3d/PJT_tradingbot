@@ -337,6 +337,9 @@ class IbkrSentimentBot:
             current_positions=current_positions,
             marks={p.symbol: p.mark_price for p in positions},
             betas=betas,
+            opened_today=await self.db.symbols_filled_since(
+                datetime.combine(trading_day(now), datetime.min.time(), tzinfo=NEW_YORK)
+            ),
         )
         result.stale_cancelled = pre.stale_cancelled
         result.foreign_open_orders = pre.foreign_open_orders
@@ -397,6 +400,9 @@ def build_default_bot(
         order_style=cfg.execution.order_style,
         limit_offset_bps=cfg.execution.limit_offset_bps,
         short_policy=cfg.execution.short_policy(),
+        pdt_check=cfg.execution.pdt_check_enabled,
+        margin_check=cfg.execution.margin_check_enabled,
+        margin_buffer=cfg.execution.margin_buffer_pct,
     )
     calendar = (
         MarketCalendar(

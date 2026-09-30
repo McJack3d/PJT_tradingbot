@@ -22,6 +22,7 @@ from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
     Broker,
+    MarginImpact,
     OpenOrderView,
     OrderRequest,
     OrderResult,
@@ -183,6 +184,25 @@ class PaperBroker(Broker):
 
     async def order_status(self, client_order_id: str) -> OrderResult | None:
         return self._orders.get(client_order_id)
+
+    # Reg T-style initial margin for the paper account.
+    initial_margin_rate = Decimal("0.5")
+
+    async def what_if(self, req: OrderRequest) -> MarginImpact | None:
+        account = await self.account_summary()
+        quote = await self.quote(req.symbol)
+        price = quote.ask if req.side == OrderSide.BUY else quote.bid
+        price = price or quote.last
+        cur = self._positions.get(req.symbol, (Decimal("0"), Decimal("0")))[0]
+        signed = req.qty if req.side == OrderSide.BUY else -req.qty
+        gross_change = (abs(cur + signed) - abs(cur)) * price
+        change = gross_change * self.initial_margin_rate
+        init_before = account.gross_position_value * self.initial_margin_rate
+        return MarginImpact(
+            init_margin_change=change,
+            init_margin_after=init_before + change,
+            equity_with_loan_after=account.net_liquidation,
+        )
 
     async def short_availability(self, symbol: str) -> ShortInfo | None:
         # Paper default: easy to borrow, no restriction. Tests override

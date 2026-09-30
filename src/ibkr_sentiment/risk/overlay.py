@@ -46,7 +46,7 @@ class RiskVerdict:
     reason: str
 
 
-def _is_risk_reducing(current: Decimal, delta: Decimal) -> bool:
+def is_risk_reducing(current: Decimal, delta: Decimal) -> bool:
     """True when `delta` moves the position toward zero without
     flipping it through to the other side."""
     if current == 0 or delta == 0:
@@ -159,7 +159,7 @@ class RiskOverlay:
         if nlv <= 0:
             return [
                 (d, RiskVerdict(True, "risk-reducing"))
-                if _is_risk_reducing(current_positions.get(d.symbol, Decimal("0")), d.target_qty)
+                if is_risk_reducing(current_positions.get(d.symbol, Decimal("0")), d.target_qty)
                 else (d, RiskVerdict(False, "non-positive NLV"))
                 for d in deltas
             ]
@@ -170,7 +170,7 @@ class RiskOverlay:
         increasing: list[int] = []
         for i, d in enumerate(deltas):
             cur = current_positions.get(d.symbol, Decimal("0"))
-            if _is_risk_reducing(cur, d.target_qty):
+            if is_risk_reducing(cur, d.target_qty):
                 verdicts[i] = RiskVerdict(True, "risk-reducing")
                 continue
             price = prices.get(d.symbol, Decimal("0"))

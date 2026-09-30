@@ -63,7 +63,7 @@ numbers or silent degradation, **L** = hygiene.
 | 11 | M ✅ fixed | `dollar_neutral.py` | "Dollar-neutral" ≠ market-neutral: long NVDA/TSLA (β≈1.8) vs short XOM/UNH (β≈0.6) is net long beta. Sector trim uses `quantize(Decimal("1"))` (banker's rounding → can round *up* past cap). |
 | 12 | M ✅ fixed | config | Reuters RSS feeds were discontinued in 2020 (silent zero items). SEC EDGAR needs a real contact UA. LLM model id is stale. |
 | 13 | L ✅ fixed | `ExecutionEngine` | `DRY_RUN` still requires a full IB connection with trading permissions; use `readonly=True` for dry-run. |
-| 14 | L | general | No pre-trade margin check (`whatIfOrderAsync`), no PDT awareness, no FX handling for non-USD base accounts. |
+| 14 | L ✅ fixed (FX: equity and loss stops are measured in USD, so for a non-USD base account EURUSD moves count toward the stops; USD bought on margin accrues interest) | general | No pre-trade margin check (`whatIfOrderAsync`), no PDT awareness, no FX handling for non-USD base accounts. |
 
 **Conclusion:** the sentiment bot is a well-structured prototype but is
 not safe for `live`, and its core edge is unvalidated (the repo's own

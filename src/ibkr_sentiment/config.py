@@ -180,6 +180,13 @@ class ExecutionConfig(BaseModel):
     allow_hard_to_borrow: bool = False
     min_shortable_multiple: Decimal = Decimal("2")
     block_shorts_under_ssr: bool = True
+    # FINRA PDT: with 0 day trades remaining (broker-reported), don't
+    # close a position opened the same day; hold it overnight.
+    pdt_check_enabled: bool = True
+    # Price risk-increasing orders with IBKR's what-if first and keep the
+    # batch's initial margin under (1 - buffer) of equity-with-loan.
+    margin_check_enabled: bool = True
+    margin_buffer_pct: Decimal = Decimal("0.10")
 
     def short_policy(self) -> ShortPolicy:
         # Local import: risk.shorting -> risk.overlay -> config.
