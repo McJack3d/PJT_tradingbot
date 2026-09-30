@@ -96,6 +96,7 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         max_tokens=cfg.llm.max_tokens,
         temperature=cfg.llm.temperature,
         request_timeout_s=cfg.llm.request_timeout_s,
+        effort=cfg.llm.effort,
     )
     pipeline = SentimentPipeline(
         scorer=scorer,
@@ -130,6 +131,8 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         poll_interval_s=cfg.ingestion.poll_interval_s,
         max_items_per_poll=cfg.ingestion.max_items_per_poll,
         dedup_window_minutes=cfg.ingestion.dedup_window_minutes,
+        sec_user_agent=secrets.sec_user_agent or cfg.ingestion.sec_user_agent,
+        sec_enabled=cfg.ingestion.sec_filings_enabled,
     )
     return bot
 

@@ -39,6 +39,12 @@ from src.ibkr_sentiment.sentiment.models import (
     TimeHorizon,
     Verdict,
 )
+from src.logging_setup import log
+
+ANTHROPIC_DEFAULT_MODEL = "claude-opus-5-5"
+# Server-side refusal fallback: on a policy decline the API re-runs the
+# request on a fallback model it picks by refusal category.
+_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 PROMPT_TEMPLATE = """You are a senior buy-side analyst acting as a qualitative
 gatekeeper on a news-driven trading signal. Reason step by step, then output
@@ -235,18 +241,22 @@ class AnthropicLLMGatekeeper:
     def __init__(
         self,
         api_key: str,
-        model: str = "claude-opus-4-7",
-        max_tokens: int = 800,
-        temperature: float = 0.0,
+        model: str = ANTHROPIC_DEFAULT_MODEL,
+        max_tokens: int = 16000,
+        effort: str = "low",
         max_concurrent: int = 4,
         request_timeout_s: float = 30.0,
     ):
+        # No temperature: current Claude models reject sampling params.
+        # Thinking is always on and its tokens count toward max_tokens,
+        # so max_tokens is a generous ceiling, not the verdict size;
+        # `effort` is the cost/depth control (low suits classification).
         if not api_key:
             raise ValueError("AnthropicLLMGatekeeper requires an API key")
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
-        self.temperature = temperature
+        self.effort = effort
         self._sem = asyncio.Semaphore(max_concurrent)
         self.request_timeout_s = request_timeout_s
         self._client = None
@@ -280,16 +290,33 @@ class AnthropicLLMGatekeeper:
         async with self._sem:
             try:
                 resp = await asyncio.wait_for(
-                    client.messages.create(
+                    client.beta.messages.create(
                         model=self.model,
                         max_tokens=self.max_tokens,
-                        temperature=self.temperature,
+                        output_config={"effort": self.effort},
+                        betas=[_FALLBACK_BETA],
+                        fallbacks="default",
                         messages=[{"role": "user", "content": prompt}],
                     ),
                     timeout=self.request_timeout_s,
                 )
-            except Exception:
+            except Exception as e:
+                log.warning(
+                    "llm_gatekeeper.anthropic_error",
+                    item_id=item.id,
+                    model=self.model,
+                    error=f"{type(e).__name__}: {e}",
+                )
                 return _noise(item.id)
+        stop_reason = getattr(resp, "stop_reason", None)
+        if stop_reason in ("refusal", "max_tokens"):
+            log.warning(
+                "llm_gatekeeper.anthropic_incomplete",
+                item_id=item.id,
+                stop_reason=stop_reason,
+                category=getattr(getattr(resp, "stop_details", None), "category", None),
+            )
+            return _noise(item.id)
         text = ""
         for block in getattr(resp, "content", []) or []:
             chunk = getattr(block, "text", None)
@@ -382,7 +409,8 @@ class OpenAILLMGatekeeper:
 def build_gatekeeper(provider: str, *, anthropic_key: str = "", openai_key: str = "",
                      model: str = "", max_concurrent: int = 4,
                      max_tokens: int = 800, temperature: float = 0.0,
-                     request_timeout_s: float = 30.0) -> LLMGatekeeper:
+                     request_timeout_s: float = 30.0,
+                     effort: str = "low") -> LLMGatekeeper:
     """Factory: pick a gatekeeper backend based on `provider` string."""
     provider = (provider or "stub").lower()
     if provider == "stub":
@@ -390,9 +418,9 @@ def build_gatekeeper(provider: str, *, anthropic_key: str = "", openai_key: str 
     if provider == "anthropic":
         return AnthropicLLMGatekeeper(
             api_key=anthropic_key,
-            model=model or "claude-opus-4-7",
+            model=model or ANTHROPIC_DEFAULT_MODEL,
             max_tokens=max_tokens,
-            temperature=temperature,
+            effort=effort,
             max_concurrent=max_concurrent,
             request_timeout_s=request_timeout_s,
         )

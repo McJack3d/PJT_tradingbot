@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from src.ibkr_sentiment.sentiment.models import NewsItem
+from src.logging_setup import log
 
 Fetcher = Callable[[str], Awaitable[str]]
 
@@ -161,19 +162,65 @@ class _HttpFetcher(Protocol):
     async def __call__(self, url: str) -> str: ...
 
 
-async def _httpx_fetcher(url: str) -> str:
-    import httpx
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", ".invalid", "localhost")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    if "sec.gov" in url:
-        headers["User-Agent"] = "trad-bot research contact@example.com"
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.text
+def is_sec_url(url: str) -> bool:
+    return "sec.gov" in url
+
+
+def valid_sec_user_agent(ua: str | None) -> bool:
+    """SEC EDGAR requires a User-Agent naming who you are with a real
+    contact email, and throttles or blocks requests without one."""
+    if not ua or "@" not in ua:
+        return False
+    return not any(d in ua.lower() for d in _PLACEHOLDER_DOMAINS)
+
+
+def expand_feed_urls(feeds: Iterable[str], universe: list[str], chunk: int = 20) -> list[str]:
+    """Expand a `{symbols}` placeholder into one URL per chunk of the
+    universe (comma-joined), e.g. Yahoo Finance's per-ticker headline
+    feed. URLs without the placeholder pass through unchanged."""
+    out: list[str] = []
+    for url in feeds:
+        if "{symbols}" not in url:
+            out.append(url)
+            continue
+        for i in range(0, len(universe), chunk):
+            out.append(url.replace("{symbols}", ",".join(universe[i : i + chunk])))
+    return out
+
+
+def make_httpx_fetcher(sec_user_agent: str | None = None) -> _HttpFetcher:
+    async def fetch(url: str) -> str:
+        import httpx
+
+        ua = _BROWSER_UA
+        if is_sec_url(url):
+            if not valid_sec_user_agent(sec_user_agent):
+                raise ValueError("SEC EDGAR needs a real contact User-Agent")
+            ua = sec_user_agent  # type: ignore[assignment]
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers={"User-Agent": ua})
+            resp.raise_for_status()
+            return resp.text
+
+    return fetch
+
+
+_httpx_fetcher = make_httpx_fetcher()
+
+
+@dataclass
+class FeedHealth:
+    consecutive_errors: int = 0
+    consecutive_empty: int = 0
+    last_ok: datetime | None = None
+    last_error: str = ""
 
 
 class IngestionService:
@@ -193,12 +240,30 @@ class IngestionService:
         max_items_per_poll: int = 50,
         dedup_window_minutes: int = 240,
         fetcher: _HttpFetcher | None = None,
+        sec_user_agent: str | None = None,
+        sec_enabled: bool = True,
+        unhealthy_after: int = 3,
     ):
-        self.feeds = list(feeds)
         self.universe = list(universe)
+        self.disabled_feeds: dict[str, str] = {}
+        self.feeds = []
+        for url in expand_feed_urls(feeds, self.universe):
+            if is_sec_url(url) and not sec_enabled:
+                self.disabled_feeds[url] = "sec_filings_enabled is false"
+            elif is_sec_url(url) and not valid_sec_user_agent(sec_user_agent):
+                self.disabled_feeds[url] = (
+                    "SEC requires a real contact User-Agent: set ingestion.sec_user_agent "
+                    "or SEC_USER_AGENT to e.g. 'trad-bot you@yourdomain.com'"
+                )
+            else:
+                self.feeds.append(url)
+        for url, why in self.disabled_feeds.items():
+            log.warning("ingestion.feed_disabled", url=url, reason=why)
         self.poll_interval_s = poll_interval_s
         self.max_items_per_poll = max_items_per_poll
-        self.fetcher = fetcher or _httpx_fetcher
+        self.fetcher = fetcher or make_httpx_fetcher(sec_user_agent)
+        self.unhealthy_after = unhealthy_after
+        self.health: dict[str, FeedHealth] = {url: FeedHealth() for url in self.feeds}
         self.deduper = Deduper(timedelta(minutes=dedup_window_minutes))
         self._task: asyncio.Task | None = None
         self._on_item: Callable[[NewsItem], Awaitable[None]] | None = None
@@ -207,11 +272,28 @@ class IngestionService:
     async def fetch_once(self) -> list[NewsItem]:
         out: list[NewsItem] = []
         for url in self.feeds:
+            h = self.health.setdefault(url, FeedHealth())
             try:
                 body = await self.fetcher(url)
-            except Exception:
+            except Exception as e:
+                h.consecutive_errors += 1
+                h.last_error = f"{type(e).__name__}: {e}"
+                if h.consecutive_errors == self.unhealthy_after:
+                    log.warning(
+                        "ingestion.feed_failing",
+                        url=url,
+                        consecutive_errors=h.consecutive_errors,
+                        error=h.last_error,
+                    )
                 continue
-            for item in parse_rss(body)[: self.max_items_per_poll]:
+            parsed = parse_rss(body)
+            h.consecutive_errors = 0
+            h.consecutive_empty = 0 if parsed else h.consecutive_empty + 1
+            if parsed:
+                h.last_ok = datetime.now(UTC)
+            elif h.consecutive_empty == self.unhealthy_after:
+                log.warning("ingestion.feed_empty", url=url, polls=h.consecutive_empty)
+            for item in parsed[: self.max_items_per_poll]:
                 item.symbols = detect_symbols(
                     f"{item.title}\n{item.body}", self.universe
                 )
@@ -221,6 +303,14 @@ class IngestionService:
                     continue
                 out.append(item)
         return out
+
+    def unhealthy_feeds(self) -> dict[str, FeedHealth]:
+        return {
+            url: h
+            for url, h in self.health.items()
+            if h.consecutive_errors >= self.unhealthy_after
+            or h.consecutive_empty >= self.unhealthy_after
+        }
 
     async def start(
         self, on_item: Callable[[NewsItem], Awaitable[None]]
@@ -246,8 +336,8 @@ class IngestionService:
                 items = await self.fetch_once()
                 for item in items:
                     await self._on_item(item)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("ingestion.poll_error", error=f"{type(e).__name__}: {e}")
             try:
                 await asyncio.wait_for(
                     self._stopping.wait(), timeout=self.poll_interval_s

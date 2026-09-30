@@ -191,6 +191,7 @@ The bot reads from `.env` (see `.env.example`):
 | `IBKR_ACCOUNT` | IbkrBroker (optional — only needed for multi-account logins) |
 | `ANTHROPIC_API_KEY` | LLM gatekeeper (provider=anthropic) |
 | `OPENAI_API_KEY` | LLM gatekeeper (provider=openai/fingpt) |
+| `SEC_USER_AGENT` | SEC EDGAR 8-K feed: `"<name> <contact email>"` (required by the SEC; overrides `ingestion.sec_user_agent`) |
 | `REDIS_URL` | rate limiter |
 | `POSTGRES_URL` | optional override for `db_url` |
 | `QDRANT_URL` / `QDRANT_API_KEY` | vector store |

@@ -63,9 +63,16 @@ class LLMConfig(BaseModel):
     """
 
     provider: str = "stub"  # "stub" | "anthropic" | "openai" | "fingpt"
-    model: str = "claude-opus-4-7"
-    temperature: float = 0.0
-    max_tokens: int = 800
+    # Empty = the provider's default (anthropic: claude-opus-5-5,
+    # openai: gpt-4o-mini). A non-empty value must match the provider.
+    model: str = ""
+    temperature: float = 0.0  # OpenAI/FinGPT only; Claude rejects sampling params
+    # Output ceiling. On Claude, thinking tokens count toward it, so keep
+    # it generous; it caps cost, it is not the verdict length.
+    max_tokens: int = 16000
+    # Claude only: low | medium | high | xhigh | max. Classification does
+    # well at low; raise only if measured verdict quality improves.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
     max_concurrent: int = 4
     request_timeout_s: float = 30.0
     # Conviction floor: LLM verdicts below this are discarded.
@@ -77,9 +84,12 @@ class LLMConfig(BaseModel):
 class IngestionConfig(BaseModel):
     """Stage 0 — raw text feeds."""
 
+    # `{symbols}` expands to comma-joined universe chunks.
     rss_feeds: list[str] = Field(default_factory=list)
     sec_filings_enabled: bool = False
-    sec_user_agent: str = "trad-bot research contact@example.com"
+    # SEC EDGAR requires "<name> <contact email>"; the SEC feed is skipped
+    # until this (or the SEC_USER_AGENT env var) is a real contact.
+    sec_user_agent: str = ""
     poll_interval_s: int = 60
     max_items_per_poll: int = 50
     # Dedup window — items with the same (source, url) seen in the last
@@ -226,6 +236,7 @@ class IbkrSecrets(BaseSettings):
 
     ibkr_account: str = ""
     anthropic_api_key: str = ""
+    sec_user_agent: str = ""  # SEC_USER_AGENT, overrides ingestion.sec_user_agent
     openai_api_key: str = ""
     fingpt_api_key: str = ""
     redis_url: str = ""

@@ -61,7 +61,7 @@ numbers or silent degradation, **L** = hygiene.
 | 9 | M ✅ fixed | `broker/ibkr.py` `quote` | `reqMktData` never cancelled → leaks market-data lines until the 100-line cap is hit. Contracts are never qualified (`qualifyContractsAsync`) — ambiguous symbols can route wrong. |
 | 10 | M ✅ fixed | `bot.py` | Pulls 120 daily bars per signalled symbol **every tick** → burns historical-data pacing. Daily bars should be cached once per day. |
 | 11 | M ✅ fixed | `dollar_neutral.py` | "Dollar-neutral" ≠ market-neutral: long NVDA/TSLA (β≈1.8) vs short XOM/UNH (β≈0.6) is net long beta. Sector trim uses `quantize(Decimal("1"))` (banker's rounding → can round *up* past cap). |
-| 12 | M | config | Reuters RSS feeds were discontinued in 2020 (silent zero items). SEC EDGAR needs a real contact UA. LLM model id is stale. |
+| 12 | M ✅ fixed | config | Reuters RSS feeds were discontinued in 2020 (silent zero items). SEC EDGAR needs a real contact UA. LLM model id is stale. |
 | 13 | L | `ExecutionEngine` | `DRY_RUN` still requires a full IB connection with trading permissions; use `readonly=True` for dry-run. |
 | 14 | L | general | No pre-trade margin check (`whatIfOrderAsync`), no PDT awareness, no FX handling for non-USD base accounts. |
 

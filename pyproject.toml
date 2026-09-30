@@ -55,7 +55,7 @@ sentiment = [
     "torch>=2.2",
 ]
 llm = [
-    "anthropic>=0.39",
+    "anthropic>=1.9",  # 1.x: output_config / fallbacks; no sampling params
     "openai>=1.40",
 ]
 redis = [

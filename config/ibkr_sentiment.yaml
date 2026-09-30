@@ -52,12 +52,16 @@ ibkr:
   connect_timeout_s: 15.0
 
 ingestion:
+  # Reuters' RSS feeds were shut down in 2020 and returned nothing.
+  # {symbols} expands to the universe, 20 tickers per URL.
   rss_feeds:
-    - https://feeds.reuters.com/reuters/businessNews
-    - https://feeds.reuters.com/reuters/companyNews
+    - https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbols}&region=US&lang=en-US
+    - https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies
     - https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&owner=include&count=40&output=atom
+  # SEC EDGAR needs a real contact User-Agent ("<name> <email>"). Set it
+  # here or via the SEC_USER_AGENT env var, then enable the 8-K feed.
   sec_filings_enabled: false
-  sec_user_agent: "trad-bot research contact@example.com"
+  sec_user_agent: ""
   poll_interval_s: 60
   max_items_per_poll: 50
   dedup_window_minutes: 240
@@ -72,9 +76,10 @@ finbert:
 
 llm:
   provider: stub        # stub | anthropic | openai | fingpt
-  model: claude-opus-4-7
-  temperature: 0.0
-  max_tokens: 800
+  model: ""            # empty = provider default (anthropic: claude-opus-5-5)
+  temperature: 0.0     # openai/fingpt only; Claude rejects sampling params
+  max_tokens: 16000    # ceiling; Claude's thinking tokens count toward it
+  effort: low          # Claude: low | medium | high | xhigh | max
   max_concurrent: 4
   request_timeout_s: 30.0
   min_conviction: 0.55
