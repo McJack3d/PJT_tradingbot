@@ -17,6 +17,7 @@ from src.ibkr_sentiment.bot import build_default_bot
 from src.ibkr_sentiment.broker.base import Bar
 from src.ibkr_sentiment.broker.paper import PaperBroker
 from src.ibkr_sentiment.config import (
+    ExecutionConfig,
     FinBertConfig,
     IbkrMode,
     IbkrSentimentConfig,
@@ -73,6 +74,9 @@ def _make_cfg() -> IbkrSentimentConfig:
             max_net_exposure_pct=Decimal("0.5"),  # loose for the test
             max_position_pct=Decimal("0.25"),
         ),
+        # These tests tick on the wall clock; the hours gate has its own
+        # tests in test_ibkr_market_hours.py.
+        execution=ExecutionConfig(enforce_market_hours=False),
         db_url="sqlite+aiosqlite:///:memory:",
     )
 
@@ -172,3 +176,89 @@ async def test_drawdown_stop_halts_execution(tmp_path: Path):
         assert any("account_halt" in e[0] for e in report.execution.errors)
     finally:
         await bot.stop()
+
+
+class _CountingPaperBroker(PaperBroker):
+    """Paper broker that records cancel/flatten calls in order."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.calls: list[str] = []
+
+    async def cancel_all_orders(self) -> None:
+        self.calls.append("cancel")
+
+    async def flatten_all(self):
+        self.calls.append("flatten")
+        return await super().flatten_all()
+
+
+async def _open_long(broker: PaperBroker, symbol: str, qty: str) -> None:
+    from src.ibkr_sentiment.broker.base import OrderRequest, OrderSide
+
+    await broker.place_order(
+        OrderRequest(symbol=symbol, side=OrderSide.BUY, qty=Decimal(qty))
+    )
+
+
+@pytest.mark.asyncio
+async def test_drawdown_without_news_flattens_once(tmp_path: Path):
+    """Regression: the account check only ran when signals existed, and
+    a halt never flattened. A drawdown on a quiet news day must cancel
+    open orders, flatten the book once, and stay halted."""
+    cfg = _make_cfg()
+    cfg.db_url = f"sqlite+aiosqlite:///{tmp_path}/e2e.db"
+    broker = _CountingPaperBroker(starting_cash=Decimal("10000"))
+    await broker.connect()
+    broker.set_quote("AAPL", bid=Decimal("100"), ask=Decimal("100"))
+    await _open_long(broker, "AAPL", "20")
+
+    bot = build_default_bot(cfg, broker, db_url=cfg.db_url)
+    await bot.start()
+    try:
+        first = await bot.tick()  # sets today's anchor
+        assert "account_halt" not in first.notes
+
+        broker.set_quote("AAPL", bid=Decimal("50"), ask=Decimal("50"))  # -10% NLV
+        halted = await bot.tick()
+        assert "account_halt" in halted.notes
+        assert halted.execution is not None
+        assert any(e[0] == "account_halt" for e in halted.execution.errors)
+        assert len(halted.execution.flattened) == 1
+        assert broker.calls == ["cancel", "flatten"]
+        assert await broker.positions() == []
+
+        again = await bot.tick()
+        assert "account_halt" in again.notes
+        assert broker.calls == ["cancel", "flatten"]  # no duplicate flatten
+    finally:
+        await bot.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_restores_daily_anchor(tmp_path: Path):
+    """A restart mid-session must not reset the daily loss stop."""
+    cfg = _make_cfg()
+    cfg.db_url = f"sqlite+aiosqlite:///{tmp_path}/e2e.db"
+    broker = PaperBroker(starting_cash=Decimal("10000"))
+    await broker.connect()
+    broker.set_quote("AAPL", bid=Decimal("100"), ask=Decimal("100"))
+    await _open_long(broker, "AAPL", "20")
+
+    bot = build_default_bot(cfg, broker, db_url=cfg.db_url)
+    await bot.start()
+    await bot.tick()
+    anchor = bot.overlay.daily_anchor
+    await bot.stop()
+
+    await broker.connect()
+    broker.set_quote("AAPL", bid=Decimal("85"), ask=Decimal("85"))  # -3% on the day
+    restarted = build_default_bot(cfg, broker, db_url=cfg.db_url)
+    await restarted.start()
+    try:
+        assert restarted.overlay.daily_anchor == anchor
+        report = await restarted.tick()
+        assert "account_halt" in report.notes
+        assert "daily" in report.execution.errors[0][1]
+    finally:
+        await restarted.stop()

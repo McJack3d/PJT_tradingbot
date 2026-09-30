@@ -22,6 +22,8 @@ from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
     Broker,
+    MarginImpact,
+    OpenOrderView,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -29,6 +31,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderType,
     PositionView,
     Quote,
+    ShortInfo,
 )
 
 
@@ -49,6 +52,9 @@ class PaperBroker(Broker):
         # symbol -> (qty, avg_cost)
         self._positions: dict[str, tuple[Decimal, Decimal]] = {}
         self._orders: dict[str, OrderResult] = {}
+        # Non-marketable LIMIT orders: broker id -> (request, live result)
+        self._resting: dict[str, tuple[OrderRequest, OrderResult]] = {}
+        self._short_info: dict[str, ShortInfo | None] = {}
         self._lock = asyncio.Lock()
 
     # ---- lifecycle ---------------------------------------------------
@@ -86,7 +92,8 @@ class PaperBroker(Broker):
         for sym, (qty, avg_cost) in self._positions.items():
             if qty == 0:
                 continue
-            mark = self._quotes[sym].last if sym in self._quotes else avg_cost
+            quoted = sym in self._quotes
+            mark = self._quotes[sym].last if quoted else avg_cost
             out.append(
                 PositionView(
                     symbol=sym,
@@ -94,6 +101,7 @@ class PaperBroker(Broker):
                     avg_cost=avg_cost,
                     mark_price=mark,
                     unrealized_pnl=(mark - avg_cost) * qty,
+                    mark_source="quote" if quoted else "cost",
                 )
             )
         return out
@@ -123,17 +131,31 @@ class PaperBroker(Broker):
             client_id = req.client_order_id or uuid4().hex
             broker_id = f"P-{uuid4().hex[:10]}"
             quote = await self.quote(req.symbol)
-            # Market order: fill at mid + slippage in the trade direction.
-            if req.order_type == OrderType.MARKET:
-                mid = (quote.bid + quote.ask) / 2 if quote.ask else quote.last
-                bps = self.slippage_bps / Decimal("10000")
-                if req.side == OrderSide.BUY:
-                    fill_price = mid * (Decimal("1") + bps)
-                else:
-                    fill_price = mid * (Decimal("1") - bps)
-            else:
-                fill_price = (
-                    req.limit_price if req.limit_price is not None else quote.last
+            # Fill at mid + slippage in the trade direction. A LIMIT
+            # order fills only if marketable (buy limit >= ask, sell
+            # limit <= bid), never through its limit; otherwise it rests
+            # until cancelled — like a real book, without partials.
+            mid = (quote.bid + quote.ask) / 2 if quote.ask else quote.last
+            bps = self.slippage_bps / Decimal("10000")
+            buy = req.side == OrderSide.BUY
+            fill_price = mid * (Decimal("1") + bps if buy else Decimal("1") - bps)
+            if req.order_type == OrderType.LIMIT and req.limit_price is not None:
+                touch = (quote.ask or quote.last) if buy else (quote.bid or quote.last)
+                marketable = req.limit_price >= touch if buy else req.limit_price <= touch
+                if not marketable:
+                    resting = OrderResult(
+                        client_order_id=client_id,
+                        broker_order_id=broker_id,
+                        status=OrderStatus.SUBMITTED,
+                        filled_qty=Decimal("0"),
+                        avg_fill_price=Decimal("0"),
+                        submitted_at=datetime.now(UTC),
+                    )
+                    self._orders[client_id] = resting
+                    self._resting[broker_id] = (req, resting)
+                    return resting
+                fill_price = min(fill_price, req.limit_price) if buy else max(
+                    fill_price, req.limit_price
                 )
             qty = req.qty if req.side == OrderSide.BUY else -req.qty
             self._apply_fill(req.symbol, qty, fill_price)
@@ -149,8 +171,66 @@ class PaperBroker(Broker):
             return result
 
     async def cancel_order(self, broker_order_id: str) -> None:
-        # Paper broker fills synchronously, so cancellation is a no-op.
-        return None
+        entry = self._resting.pop(broker_order_id, None)
+        if entry is not None:
+            entry[1].status = OrderStatus.CANCELED
+
+    async def cancel_all_orders(self) -> None:
+        for broker_id in list(self._resting):
+            await self.cancel_order(broker_id)
+
+    async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
+        return self._orders.get(order.client_order_id, order)
+
+    async def order_status(self, client_order_id: str) -> OrderResult | None:
+        return self._orders.get(client_order_id)
+
+    # Reg T-style initial margin for the paper account.
+    initial_margin_rate = Decimal("0.5")
+
+    async def what_if(self, req: OrderRequest) -> MarginImpact | None:
+        account = await self.account_summary()
+        quote = await self.quote(req.symbol)
+        price = quote.ask if req.side == OrderSide.BUY else quote.bid
+        price = price or quote.last
+        cur = self._positions.get(req.symbol, (Decimal("0"), Decimal("0")))[0]
+        signed = req.qty if req.side == OrderSide.BUY else -req.qty
+        gross_change = (abs(cur + signed) - abs(cur)) * price
+        change = gross_change * self.initial_margin_rate
+        init_before = account.gross_position_value * self.initial_margin_rate
+        return MarginImpact(
+            init_margin_change=change,
+            init_margin_after=init_before + change,
+            equity_with_loan_after=account.net_liquidation,
+        )
+
+    async def short_availability(self, symbol: str) -> ShortInfo | None:
+        # Paper default: easy to borrow, no restriction. Tests override
+        # per symbol with set_short_info().
+        return self._short_info.get(
+            symbol,
+            ShortInfo(
+                symbol=symbol,
+                shortable_shares=Decimal("1000000"),
+                shortable_level=Decimal("3"),
+                ssr_active=False,
+            ),
+        )
+
+    def set_short_info(self, info: ShortInfo | None, symbol: str | None = None) -> None:
+        """Test helper: pass `info=None, symbol=...` to simulate unknown data."""
+        self._short_info[symbol or info.symbol] = info  # type: ignore[union-attr]
+
+    async def open_orders(self) -> list[OpenOrderView]:
+        return [
+            OpenOrderView(
+                client_order_id=res.client_order_id,
+                broker_order_id=broker_id,
+                symbol=req.symbol,
+                remaining_qty=req.qty if req.side == OrderSide.BUY else -req.qty,
+            )
+            for broker_id, (req, res) in self._resting.items()
+        ]
 
     def _apply_fill(self, symbol: str, signed_qty: Decimal, price: Decimal) -> None:
         cost = signed_qty * price

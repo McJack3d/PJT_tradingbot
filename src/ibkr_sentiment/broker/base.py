@@ -34,6 +34,10 @@ class OrderStatus(str, Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED)
+
 
 @dataclass(slots=True)
 class Quote:
@@ -62,14 +66,37 @@ class PositionView:
     avg_cost: Decimal
     mark_price: Decimal
     unrealized_pnl: Decimal
+    # Where mark_price came from: "portfolio" (broker's own mark),
+    # "quote" (live market data), or "cost" (no market price available —
+    # exposure figures for this position are stale).
+    mark_source: str = "portfolio"
 
 
 @dataclass(slots=True)
 class AccountSummary:
+    """Money fields are in `currency` (USD, the trading currency): a
+    broker with a non-USD base account converts them at `fx_rate`."""
+
     net_liquidation: Decimal
     available_funds: Decimal
     gross_position_value: Decimal
     currency: str = "USD"
+    base_currency: str = "USD"
+    fx_rate: Decimal = Decimal("1")  # base-currency units per 1 USD
+    # FINRA pattern-day-trader budget from the broker; None = not
+    # limited (equity >= $25k, cash account) or unknown.
+    day_trades_remaining: int | None = None
+
+
+@dataclass(slots=True)
+class MarginImpact:
+    """Pre-trade what-if for one order, in the account's base currency.
+    Only ratios between these fields are used, so no FX is needed."""
+
+    init_margin_change: Decimal
+    init_margin_after: Decimal
+    equity_with_loan_after: Decimal
+    warning: str = ""
 
 
 @dataclass(slots=True)
@@ -82,6 +109,7 @@ class OrderRequest:
     trail_percent: Decimal | None = None
     client_order_id: str = ""
     tif: str = "DAY"
+    algo: str | None = None  # e.g. "Adaptive" (IBKR algo strategy)
     exchange: str = "SMART"
     currency: str = "USD"
 
@@ -94,6 +122,25 @@ class OrderResult:
     filled_qty: Decimal
     avg_fill_price: Decimal
     submitted_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(slots=True)
+class ShortInfo:
+    """Borrow / short-sale snapshot for one symbol. None = unknown."""
+
+    symbol: str
+    shortable_shares: Decimal | None
+    # IBKR shortable indicator: > 2.5 easy, 1.5-2.5 hard to borrow, < 1.5 none.
+    shortable_level: Decimal | None
+    ssr_active: bool
+
+
+@dataclass(slots=True)
+class OpenOrderView:
+    client_order_id: str  # IBKR orderRef; "" for orders placed outside the bot
+    broker_order_id: str
+    symbol: str
+    remaining_qty: Decimal  # signed: + buy, - sell
 
 
 class Broker(ABC):
@@ -125,6 +172,34 @@ class Broker(ABC):
 
     @abstractmethod
     async def cancel_order(self, broker_order_id: str) -> None: ...
+
+    @abstractmethod
+    async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
+        """Wait until `order` reaches a terminal status or `timeout_s`
+        elapses; return the latest snapshot either way."""
+
+    @abstractmethod
+    async def order_status(self, client_order_id: str) -> OrderResult | None:
+        """Look up an order the broker still knows about by our
+        client order id. None if the broker has no record of it."""
+
+    @abstractmethod
+    async def open_orders(self) -> list[OpenOrderView]:
+        """Every working order on the account, ours or not."""
+
+    @abstractmethod
+    async def what_if(self, req: OrderRequest) -> MarginImpact | None:
+        """Margin impact of `req` without sending it, or None if the
+        broker can't tell."""
+
+    @abstractmethod
+    async def short_availability(self, symbol: str) -> ShortInfo | None:
+        """Borrow availability and Rule 201 state, or None if unknown."""
+
+    @abstractmethod
+    async def cancel_all_orders(self) -> None:
+        """Cancel every open order, including ones placed before a
+        restart."""
 
     async def flatten_all(self) -> list[OrderResult]:
         """Close every open position with market orders. Default

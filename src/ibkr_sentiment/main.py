@@ -61,7 +61,7 @@ async def _build_broker(cfg: IbkrSentimentConfig) -> Broker:
         broker = PaperBroker(starting_cash=cfg.risk.starting_equity_usd)
         await broker.connect()
         return broker
-    from src.ibkr_sentiment.broker.ibkr import IbkrBroker
+    from src.ibkr_sentiment.broker.ibkr import ContractSpec, IbkrBroker
 
     secrets = IbkrSecrets()
     return IbkrBroker(
@@ -69,12 +69,20 @@ async def _build_broker(cfg: IbkrSentimentConfig) -> Broker:
         port=cfg.ibkr.port,
         client_id=cfg.ibkr.client_id,
         account=cfg.ibkr.account or secrets.ibkr_account or None,
-        readonly=cfg.ibkr.readonly,
+        # Dry-run never needs trading permissions: connect read-only so
+        # IB Gateway itself rejects any order, whatever the bot does.
+        readonly=cfg.ibkr.readonly or cfg.mode == IbkrMode.DRY_RUN,
         connect_timeout_s=cfg.ibkr.connect_timeout_s,
         redis_url=cfg.rate_limit.redis_url or secrets.redis_url or None,
         orders_per_minute=cfg.rate_limit.orders_per_minute,
         historical_requests_per_10min=cfg.rate_limit.historical_requests_per_10min,
         market_data_lines=cfg.rate_limit.market_data_lines,
+        contract_specs={
+            u.symbol: ContractSpec(
+                currency=u.currency, primary_exchange=u.primary_exchange, con_id=u.con_id
+            )
+            for u in cfg.universe
+        },
     )
 
 
@@ -90,6 +98,7 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         max_tokens=cfg.llm.max_tokens,
         temperature=cfg.llm.temperature,
         request_timeout_s=cfg.llm.request_timeout_s,
+        effort=cfg.llm.effort,
     )
     pipeline = SentimentPipeline(
         scorer=scorer,
@@ -112,6 +121,13 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         broker=broker,
         overlay=overlay,
         dry_run=cfg.mode == IbkrMode.DRY_RUN,
+        fill_timeout_s=cfg.fill_timeout_s,
+        order_style=cfg.execution.order_style,
+        limit_offset_bps=cfg.execution.limit_offset_bps,
+        short_policy=cfg.execution.short_policy(),
+        pdt_check=cfg.execution.pdt_check_enabled,
+        margin_check=cfg.execution.margin_check_enabled,
+        margin_buffer=cfg.execution.margin_buffer_pct,
     )
     universe_symbols = [u.symbol for u in cfg.universe]
     bot.ingestion = IngestionService(
@@ -120,6 +136,8 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         poll_interval_s=cfg.ingestion.poll_interval_s,
         max_items_per_poll=cfg.ingestion.max_items_per_poll,
         dedup_window_minutes=cfg.ingestion.dedup_window_minutes,
+        sec_user_agent=secrets.sec_user_agent or cfg.ingestion.sec_user_agent,
+        sec_enabled=cfg.ingestion.sec_filings_enabled,
     )
     return bot
 

@@ -117,11 +117,15 @@ class TradeRow(Base):
     broker_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     side: Mapped[TradeSide] = mapped_column(SAEnum(TradeSide))
-    qty: Mapped[Decimal] = mapped_column(DECIMAL(28, 8))
+    qty: Mapped[Decimal] = mapped_column(DECIMAL(28, 8))  # requested
+    filled_qty: Mapped[Decimal] = mapped_column(DECIMAL(28, 8), default=Decimal("0"))
     avg_fill_price: Mapped[Decimal] = mapped_column(DECIMAL(28, 8))
     status: Mapped[str] = mapped_column(String(32))
     placed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

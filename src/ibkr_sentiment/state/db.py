@@ -21,10 +21,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.ibkr_sentiment.broker.base import OrderResult
+from src.ibkr_sentiment.broker.base import OrderResult, OrderStatus
 from src.ibkr_sentiment.sentiment.models import (
     LLMVerdict,
     NewsItem,
@@ -55,6 +55,25 @@ def _ensure_sqlite_dir(url: str) -> None:
             Path(path_part).parent.mkdir(parents=True, exist_ok=True)
 
 
+# Columns added after the first release. `create_all` never alters an
+# existing table, so older databases get them via ALTER TABLE here.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "ibsent_trades": {
+        "filled_qty": "DECIMAL(28, 8) NOT NULL DEFAULT 0",
+        "updated_at": "TIMESTAMP",
+    },
+}
+
+
+def _add_missing_columns(sync_conn) -> None:
+    insp = inspect(sync_conn)
+    for table, cols in _ADDED_COLUMNS.items():
+        existing = {c["name"] for c in insp.get_columns(table)}
+        for name, ddl in cols.items():
+            if name not in existing:
+                sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
 class IbkrSentimentDB:
     def __init__(self, url: str = "sqlite+aiosqlite:///data/ibkr_sentiment.db"):
         _ensure_sqlite_dir(url)
@@ -67,6 +86,7 @@ class IbkrSentimentDB:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_add_missing_columns)
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -169,11 +189,46 @@ class IbkrSentimentDB:
                     symbol=target.symbol,
                     side=side_map[target.side],
                     qty=abs(target.target_qty),
+                    filled_qty=result.filled_qty,
                     avg_fill_price=result.avg_fill_price,
                     status=result.status.value,
                     placed_at=result.submitted_at,
+                    updated_at=datetime.now(UTC),
                 )
             )
+            await s.commit()
+
+    async def symbols_filled_since(self, since: datetime) -> set[str]:
+        """Symbols with any filled quantity since `since` — used to spot
+        same-day round trips for the PDT rule."""
+        async with self._session() as s:
+            res = await s.execute(
+                select(TradeRow.symbol)
+                .where(TradeRow.placed_at >= since)
+                .where(TradeRow.filled_qty > 0)
+                .distinct()
+            )
+            return set(res.scalars().all())
+
+    async def open_trades(self) -> list[TradeRow]:
+        """Trades whose last recorded status was not terminal — i.e. the
+        bot stopped before learning how they ended."""
+        terminal = [st.value for st in OrderStatus if st.is_terminal]
+        async with self._session() as s:
+            res = await s.execute(select(TradeRow).where(TradeRow.status.not_in(terminal)))
+            return list(res.scalars().all())
+
+    async def update_trade(self, result: OrderResult) -> None:
+        async with self._session() as s:
+            res = await s.execute(
+                select(TradeRow).where(TradeRow.client_order_id == result.client_order_id)
+            )
+            for row in res.scalars().all():
+                row.status = result.status.value
+                row.filled_qty = result.filled_qty
+                if result.avg_fill_price > 0:
+                    row.avg_fill_price = result.avg_fill_price
+                row.updated_at = datetime.now(UTC)
             await s.commit()
 
     async def record_equity(
@@ -244,5 +299,17 @@ class IbkrSentimentDB:
         async with self._session() as s:
             res = await s.execute(
                 select(EquitySnapshotRow).order_by(EquitySnapshotRow.ts.desc()).limit(1)
+            )
+            return res.scalar_one_or_none()
+
+    async def first_equity_since(self, since: datetime) -> EquitySnapshotRow | None:
+        """Earliest equity snapshot at or after `since` — used to restore
+        the daily loss-stop anchor after a restart."""
+        async with self._session() as s:
+            res = await s.execute(
+                select(EquitySnapshotRow)
+                .where(EquitySnapshotRow.ts >= since)
+                .order_by(EquitySnapshotRow.ts.asc())
+                .limit(1)
             )
             return res.scalar_one_or_none()

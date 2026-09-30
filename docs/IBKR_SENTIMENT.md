@@ -109,7 +109,7 @@ tests/unit/test_ibkr_sentiment_*.py   unit tests
 | mode | broker | LLM | use case |
 | --- | --- | --- | --- |
 | `paper` (default) | in-memory `PaperBroker` | stub (deterministic) | quickstart, CI, full-pipeline smoke test |
-| `dry_run` | live IB Gateway connection | configured | full read path against IB, orders intercepted |
+| `dry_run` | read-only IB Gateway connection | configured | full read path against IB; orders logged, never sent (the broker refuses order calls) |
 | `live` | live IB Gateway connection | configured | real money, only after acceptance gates pass |
 
 ## Install
@@ -191,6 +191,7 @@ The bot reads from `.env` (see `.env.example`):
 | `IBKR_ACCOUNT` | IbkrBroker (optional — only needed for multi-account logins) |
 | `ANTHROPIC_API_KEY` | LLM gatekeeper (provider=anthropic) |
 | `OPENAI_API_KEY` | LLM gatekeeper (provider=openai/fingpt) |
+| `SEC_USER_AGENT` | SEC EDGAR 8-K feed: `"<name> <contact email>"` (required by the SEC; overrides `ingestion.sec_user_agent`) |
 | `REDIS_URL` | rate limiter |
 | `POSTGRES_URL` | optional override for `db_url` |
 | `QDRANT_URL` / `QDRANT_API_KEY` | vector store |

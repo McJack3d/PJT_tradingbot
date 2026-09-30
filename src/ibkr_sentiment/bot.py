@@ -17,10 +17,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from src.ibkr_sentiment.broker.base import Broker
+from src.ibkr_sentiment.bar_cache import BarCache
+from src.ibkr_sentiment.broker.base import AccountSummary, Broker
 from src.ibkr_sentiment.config import IbkrSentimentConfig
 from src.ibkr_sentiment.execution.engine import ExecutionEngine, RunResult
-from src.ibkr_sentiment.risk.overlay import RiskOverlay
+from src.ibkr_sentiment.market_hours import MarketCalendar
+from src.ibkr_sentiment.risk.overlay import NEW_YORK, RiskOverlay, trading_day
 from src.ibkr_sentiment.sentiment.ingestion import IngestionService
 from src.ibkr_sentiment.sentiment.models import LLMVerdict, NewsItem, StructuredSignal
 from src.ibkr_sentiment.sentiment.pipeline import (
@@ -28,6 +30,7 @@ from src.ibkr_sentiment.sentiment.pipeline import (
     SentimentPipeline,
     aggregate_signals,
 )
+from src.ibkr_sentiment.signal_engine.beta import estimate_beta
 from src.ibkr_sentiment.signal_engine.dollar_neutral import (
     TargetPosition,
     build_dollar_neutral_basket,
@@ -58,6 +61,17 @@ class IbkrSentimentBot:
     execution: ExecutionEngine
     db: IbkrSentimentDB
     ingestion: IngestionService | None = None
+    startup_reconciliation: RunResult | None = None
+    # None disables the market-hours gate (tests, or 24h instruments).
+    calendar: MarketCalendar | None = None
+    bar_cache: BarCache | None = None  # built from cfg when not supplied
+
+    def __post_init__(self) -> None:
+        if self.bar_cache is None:
+            self.bar_cache = BarCache(
+                broker=self.broker,
+                refresh=timedelta(minutes=self.cfg.signal.bars_refresh_minutes),
+            )
 
     # Items that arrived since the last tick. Flushed at the top of
     # `tick()`. Keeping a small buffer rather than firing inference on
@@ -71,8 +85,10 @@ class IbkrSentimentBot:
 
     async def start(self) -> None:
         await self.db.init()
+        await self._restore_daily_anchor()
         if not await self.broker.is_connected():
             await self.broker.connect()
+        await self._reconcile_on_start()
         if self.ingestion is not None:
             await self.ingestion.start(self._on_item)
 
@@ -82,6 +98,79 @@ class IbkrSentimentBot:
         if await self.broker.is_connected():
             await self.broker.disconnect()
         await self.db.close()
+
+    async def _reconcile_on_start(self) -> RunResult:
+        """Bring DB and broker back in line after a restart.
+
+        1. Trades the DB last saw as working get their final state from
+           the broker (IBKR replays today's orders on connect).
+        2. Any of our orders still working at the broker are cancelled,
+           so the first tick plans from a quiet book instead of
+           re-sending orders that are already live.
+        """
+        report = RunResult()
+        for row in await self.db.open_trades():
+            try:
+                latest = await self.broker.order_status(row.client_order_id)
+            except Exception as e:
+                report.errors.append((row.symbol, f"order_status {type(e).__name__}: {e}"))
+                continue
+            if latest is not None:
+                await self.db.update_trade(latest)
+            else:
+                report.errors.append((row.symbol, f"unknown to broker: {row.client_order_id}"))
+        await self.execution.cancel_stale_orders(report)
+        # Stale orders may have filled before the cancel landed.
+        for cid in report.stale_cancelled:
+            latest = await self.broker.order_status(cid)
+            if latest is not None:
+                await self.db.update_trade(latest)
+        self.startup_reconciliation = report
+        return report
+
+    async def _betas(self, symbols: list[str], now: datetime) -> dict[str, Decimal]:
+        """Blume-adjusted betas vs the benchmark from cached daily bars.
+        Symbols without enough history are omitted (treated as beta 1)."""
+        assert self.bar_cache is not None
+        if not symbols:
+            return {}
+        risk = self.cfg.risk
+        try:
+            bench = await self.bar_cache.get(risk.beta_benchmark, now)
+        except Exception:
+            return {}
+        out: dict[str, Decimal] = {}
+        for sym in symbols:
+            try:
+                bars = await self.bar_cache.get(sym, now)
+            except Exception:
+                continue
+            beta = estimate_beta(bars, bench, lookback=risk.beta_lookback_days)
+            if beta is not None:
+                out[sym] = beta
+        return out
+
+    async def _restore_daily_anchor(self, now: datetime | None = None) -> None:
+        """Seed the daily loss-stop anchor from today's first equity
+        snapshot so a restart mid-session can't reset the daily stop."""
+        now = now or datetime.now(UTC)
+        day = trading_day(now)
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=NEW_YORK)
+        row = await self.db.first_equity_since(day_start)
+        if row is not None:
+            self.overlay.daily_anchor = row.net_liquidation
+            self.overlay.anchor_day = day
+
+    async def _record_equity(self, account: AccountSummary) -> None:
+        positions = await self.broker.positions()
+        await self.db.record_equity(
+            net_liquidation=account.net_liquidation,
+            gross_exposure=sum(
+                (abs(p.qty * p.mark_price) for p in positions), Decimal("0")
+            ),
+            net_exposure=sum((p.qty * p.mark_price for p in positions), Decimal("0")),
+            open_positions=len(positions),
+        )
 
     # ---- ingestion side ---------------------------------------------
 
@@ -125,6 +214,21 @@ class IbkrSentimentBot:
             fresh_signals = []
             report.notes.append("no_news_buffered")
 
+        # 1b. Account-level gate. Runs every tick — before any early
+        #     return — so a drawdown halts and flattens the book even
+        #     when no news arrives.
+        account = await self.broker.account_summary()
+        prev_day = self.overlay.anchor_day
+        self.overlay.roll_daily_anchor(account.net_liquidation, now)
+        if self.overlay.anchor_day != prev_day:
+            await self._record_equity(account)
+        halt_result = RunResult()
+        if not (await self.execution.enforce_account(account, halt_result)).ok:
+            report.execution = halt_result
+            report.fresh_signals = fresh_signals
+            report.notes.append("account_halt")
+            return report
+
         # 2. Trim the rolling verdict window.
         cutoff = now - self.pipeline.cfg.signal_window
         self._recent_verdicts = [
@@ -150,9 +254,8 @@ class IbkrSentimentBot:
         snapshots: dict[str, TechnicalSnapshot] = {}
         for sig in signals:
             try:
-                bars = await self.broker.historical_bars(
-                    sig.symbol, duration="120 D", bar_size="1 day"
-                )
+                assert self.bar_cache is not None  # set in __post_init__
+                bars = await self.bar_cache.get(sig.symbol, now)
             except Exception:
                 bars = []
             closes = [float(b.close) for b in bars] if bars else []
@@ -189,8 +292,20 @@ class IbkrSentimentBot:
                 sig.technical_reason = d.technical_reason
         await self.db.record_signals(signals)
 
-        # 7. Build the dollar-neutral basket.
-        account = await self.broker.account_summary()
+        # 6b. Market-hours gate. Signals are recorded above either way;
+        #     orders only go out inside the NYSE trading window.
+        if self.calendar is not None:
+            window = self.calendar.window(now)
+            if not window.open:
+                report.decisions = symbol_decisions
+                report.fresh_signals = fresh_signals
+                report.notes.append(f"market_closed: {window.reason}")
+                return report
+
+        # 7. Build the market-neutral basket (beta-balanced by default).
+        betas: dict[str, Decimal] | None = None
+        if self.cfg.risk.neutrality == "beta":
+            betas = await self._betas([d.symbol for d in symbol_decisions], now)
         min_qty = {u.symbol: u.min_qty for u in self.cfg.universe}
         sector_of = {
             u.symbol: u.sector_etf for u in self.cfg.universe if u.sector_etf
@@ -203,31 +318,39 @@ class IbkrSentimentBot:
             min_qty=min_qty,
             sector_of=sector_of or None,
             max_sector_pct=self.cfg.risk.max_sector_pct,
+            betas=betas,
         )
 
-        # 8. Execute.
-        current_positions = {
-            p.symbol: p.qty for p in await self.broker.positions()
-        }
+        # 8. Execute. Cancel our own leftover working orders first so
+        #    positions are read from a quiet book.
+        pre = RunResult()
+        await self.execution.cancel_stale_orders(pre)
+        positions = await self.broker.positions()
+        current_positions = {p.symbol: p.qty for p in positions}
+        if betas is not None:
+            # Held names without a signal still count in the net check.
+            held = [p.symbol for p in positions if p.symbol not in betas]
+            betas.update(await self._betas(held, now))
         result = await self.execution.execute_basket(
             targets,
             account=account,
             current_positions=current_positions,
+            marks={p.symbol: p.mark_price for p in positions},
+            betas=betas,
+            opened_today=await self.db.symbols_filled_since(
+                datetime.combine(trading_day(now), datetime.min.time(), tzinfo=NEW_YORK)
+            ),
         )
+        result.stale_cancelled = pre.stale_cancelled
+        result.foreign_open_orders = pre.foreign_open_orders
+        result.errors = pre.errors + result.errors
 
         # 9. Persist the resulting trades.
         for delta, placed in result.placed:
             await self.db.record_trade(delta, placed)
 
         # 10. Equity snapshot.
-        gross = sum(abs(p.qty * p.mark_price) for p in await self.broker.positions())
-        net = sum(p.qty * p.mark_price for p in await self.broker.positions())
-        await self.db.record_equity(
-            net_liquidation=account.net_liquidation,
-            gross_exposure=Decimal(str(gross)),
-            net_exposure=Decimal(str(net)),
-            open_positions=len(current_positions),
-        )
+        await self._record_equity(account)
 
         report.decisions = symbol_decisions
         report.targets = targets
@@ -270,7 +393,25 @@ def build_default_bot(
         overlay = RiskOverlay(
             cfg=cfg.risk, starting_equity=cfg.risk.starting_equity_usd
         )
-    execution = ExecutionEngine(broker=broker, overlay=overlay)
+    execution = ExecutionEngine(
+        broker=broker,
+        overlay=overlay,
+        fill_timeout_s=cfg.fill_timeout_s,
+        order_style=cfg.execution.order_style,
+        limit_offset_bps=cfg.execution.limit_offset_bps,
+        short_policy=cfg.execution.short_policy(),
+        pdt_check=cfg.execution.pdt_check_enabled,
+        margin_check=cfg.execution.margin_check_enabled,
+        margin_buffer=cfg.execution.margin_buffer_pct,
+    )
+    calendar = (
+        MarketCalendar(
+            open_buffer=timedelta(minutes=cfg.execution.open_buffer_minutes),
+            close_buffer=timedelta(minutes=cfg.execution.close_buffer_minutes),
+        )
+        if cfg.execution.enforce_market_hours
+        else None
+    )
     return IbkrSentimentBot(
         cfg=cfg,
         broker=broker,
@@ -279,4 +420,5 @@ def build_default_bot(
         execution=execution,
         db=db,
         ingestion=ingestion,
+        calendar=calendar,
     )

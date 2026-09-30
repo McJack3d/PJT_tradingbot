@@ -2,12 +2,17 @@
 #
 #  mode: paper      — paper broker (in-process), pipeline runs end-to-end,
 #                     no IB connection required.
-#  mode: dry_run    — connects to IB Gateway, intercepts orders.
+#  mode: dry_run    — connects to IB Gateway READ-ONLY (no trading
+#                     permission needed); orders are logged, never sent.
 #  mode: live       — real money. Only after the backtest acceptance
 #                     gates from docs/IBKR_SENTIMENT.md pass.
 
 mode: paper
 
+# Each symbol is qualified with IBKR once at first use (conId resolved).
+# An ambiguous or unknown ticker is refused, not guessed: add
+# `primary_exchange: NASDAQ` (or NYSE, ARCA, ...) or `con_id: <IBKR id>`
+# to that entry to pin the exact listing.
 universe:
   - symbol: AAPL
     sector_etf: XLK
@@ -48,12 +53,16 @@ ibkr:
   connect_timeout_s: 15.0
 
 ingestion:
+  # Reuters' RSS feeds were shut down in 2020 and returned nothing.
+  # {symbols} expands to the universe, 20 tickers per URL.
   rss_feeds:
-    - https://feeds.reuters.com/reuters/businessNews
-    - https://feeds.reuters.com/reuters/companyNews
+    - https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbols}&region=US&lang=en-US
+    - https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies
     - https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&owner=include&count=40&output=atom
+  # SEC EDGAR needs a real contact User-Agent ("<name> <email>"). Set it
+  # here or via the SEC_USER_AGENT env var, then enable the 8-K feed.
   sec_filings_enabled: false
-  sec_user_agent: "trad-bot research contact@example.com"
+  sec_user_agent: ""
   poll_interval_s: 60
   max_items_per_poll: 50
   dedup_window_minutes: 240
@@ -68,9 +77,10 @@ finbert:
 
 llm:
   provider: stub        # stub | anthropic | openai | fingpt
-  model: claude-opus-4-7
-  temperature: 0.0
-  max_tokens: 800
+  model: ""            # empty = provider default (anthropic: claude-opus-5-5)
+  temperature: 0.0     # openai/fingpt only; Claude rejects sampling params
+  max_tokens: 16000    # ceiling; Claude's thinking tokens count toward it
+  effort: low          # Claude: low | medium | high | xhigh | max
   max_concurrent: 4
   request_timeout_s: 30.0
   min_conviction: 0.55
@@ -101,6 +111,11 @@ signal:
 
 risk:
   starting_equity_usd: "100000"
+  # beta: size legs so beta-weighted long == short vs the benchmark, and
+  # apply max_net_exposure_pct to beta-weighted net. dollar: legacy.
+  neutrality: beta
+  beta_benchmark: SPY          # market data only; never traded
+  beta_lookback_days: 60
   max_gross_exposure_pct: "1.50"
   max_net_exposure_pct: "0.20"
   max_position_pct: "0.05"
@@ -110,5 +125,27 @@ risk:
   trailing_stop_pct: "0.05"
   max_orders_per_minute: 20
 
+execution:
+  enforce_market_hours: true   # only trade in the NYSE regular session
+  open_buffer_minutes: 5       # skip the opening auction / widest spreads
+  close_buffer_minutes: 10     # don't leave orders working into the close
+  order_style: limit           # limit | adaptive | market
+  limit_offset_bps: "10"       # marketable limit = touch +/- 10 bps
+  # Short sales need borrow (IBKR shortable shares >= 2x order size,
+  # easy to borrow) and no Rule 201 short-sale restriction. Missing borrow
+  # data blocks the short.
+  short_check_enabled: true
+  allow_hard_to_borrow: false
+  min_shortable_multiple: "2"
+  block_shorts_under_ssr: true
+  # With 0 PDT day trades left (IBKR DayTradesRemaining), hold same-day
+  # positions overnight rather than close them.
+  pdt_check_enabled: true
+  # IBKR what-if margin check on risk-increasing orders; keep 10% of
+  # equity-with-loan free.
+  margin_check_enabled: true
+  margin_buffer_pct: "0.10"
+
 tick_seconds: 60
+fill_timeout_s: 30   # cancel any unfilled remainder after this many seconds
 db_url: sqlite+aiosqlite:///data/ibkr_sentiment.db
