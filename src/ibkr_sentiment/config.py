@@ -33,6 +33,11 @@ class UniverseEntry(BaseModel):
     symbol: str  # e.g. "AAPL"
     exchange: str = "SMART"
     currency: str = "USD"
+    # Disambiguate the IBKR contract when the ticker alone is ambiguous
+    # (the bot refuses to trade an ambiguous symbol): the listing
+    # exchange, e.g. "NASDAQ" / "NYSE", or the exact IBKR contract id.
+    primary_exchange: str | None = None
+    con_id: int | None = None
     sector_etf: str | None = None  # e.g. "XLK"; used by the dollar-neutral overlay
     min_qty: Decimal = Decimal("1")
     tick_size: Decimal = Decimal("0.01")

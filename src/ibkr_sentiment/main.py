@@ -61,7 +61,7 @@ async def _build_broker(cfg: IbkrSentimentConfig) -> Broker:
         broker = PaperBroker(starting_cash=cfg.risk.starting_equity_usd)
         await broker.connect()
         return broker
-    from src.ibkr_sentiment.broker.ibkr import IbkrBroker
+    from src.ibkr_sentiment.broker.ibkr import ContractSpec, IbkrBroker
 
     secrets = IbkrSecrets()
     return IbkrBroker(
@@ -75,6 +75,12 @@ async def _build_broker(cfg: IbkrSentimentConfig) -> Broker:
         orders_per_minute=cfg.rate_limit.orders_per_minute,
         historical_requests_per_10min=cfg.rate_limit.historical_requests_per_10min,
         market_data_lines=cfg.rate_limit.market_data_lines,
+        contract_specs={
+            u.symbol: ContractSpec(
+                currency=u.currency, primary_exchange=u.primary_exchange, con_id=u.con_id
+            )
+            for u in cfg.universe
+        },
     )
 
 

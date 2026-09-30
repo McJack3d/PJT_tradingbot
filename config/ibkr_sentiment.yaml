@@ -8,6 +8,10 @@
 
 mode: paper
 
+# Each symbol is qualified with IBKR once at first use (conId resolved).
+# An ambiguous or unknown ticker is refused, not guessed: add
+# `primary_exchange: NASDAQ` (or NYSE, ARCA, ...) or `con_id: <IBKR id>`
+# to that entry to pin the exact listing.
 universe:
   - symbol: AAPL
     sector_etf: XLK

@@ -276,7 +276,10 @@ class ExecutionEngine:
         """Marketable limit: the far touch (ask to buy, bid to sell) moved
         `limit_offset_bps` further, rounded to the tick inward so the
         cap is never exceeded."""
-        q = await self.broker.quote(symbol)
+        try:
+            q = await self.broker.quote(symbol)
+        except Exception as e:
+            raise NoQuoteError(f"{symbol}: quote failed ({type(e).__name__}: {e})") from e
         ref = q.ask if side == OrderSide.BUY else q.bid
         if ref <= 0:
             ref = q.last

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -129,6 +130,17 @@ def _status_from_ib(status: str) -> OrderStatus:
     return OrderStatus.PENDING
 
 
+class ContractError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class ContractSpec:
+    currency: str = "USD"
+    primary_exchange: str | None = None
+    con_id: int | None = None
+
+
 class IbkrBroker(Broker):
     # Quote polling: up to 50 polls of 50ms each (overridable in tests).
     _quote_poll_s: float = 0.05
@@ -146,6 +158,7 @@ class IbkrBroker(Broker):
         orders_per_minute: int = 30,
         historical_requests_per_10min: int = 50,
         market_data_lines: int = 100,
+        contract_specs: dict[str, ContractSpec] | None = None,
     ):
         self.host = host
         self.port = port
@@ -161,6 +174,7 @@ class IbkrBroker(Broker):
             ),
         )
         self._contract_cache: dict[str, Any] = {}
+        self._specs: dict[str, ContractSpec] = contract_specs or {}
         self._trades: dict[str, Any] = {}  # broker order id -> ib Trade
         # (symbol, NY trading day) -> Rule 201 carried over from yesterday
         self._ssr_carry: dict[tuple[str, date], bool] = {}
@@ -207,12 +221,36 @@ class IbkrBroker(Broker):
 
     # ---- helpers ----------------------------------------------------
 
-    def _contract(self, symbol: str, exchange: str = "SMART", currency: str = "USD"):
-        key = f"{symbol}|{exchange}|{currency}"
+    async def _contract(self, symbol: str):
+        """The IBKR-qualified stock contract for `symbol`, resolved once
+        and cached. Qualification fills in the conId and fails on an
+        unknown or ambiguous ticker, instead of letting an underspecified
+        Stock() route to whichever listing IBKR picks."""
+        spec = self._specs.get(symbol, ContractSpec())
+        key = f"{symbol}|SMART|{spec.currency}"
         if key in self._contract_cache:
             return self._contract_cache[key]
+        assert self._ib is not None
         ib_insync = self._ib_insync()
-        c = ib_insync.Stock(symbol, exchange, currency)
+        if spec.con_id:
+            wanted = ib_insync.Contract(conId=spec.con_id, exchange="SMART")
+        else:
+            wanted = ib_insync.Stock(
+                symbol, "SMART", spec.currency, primaryExchange=spec.primary_exchange or ""
+            )
+        await self._limiter.acquire("generic")
+        qualified = await self._ib.qualifyContractsAsync(wanted)
+        if not qualified:
+            raise ContractError(
+                f"{symbol}: unknown or ambiguous IBKR contract; "
+                "set primary_exchange or con_id in the universe config"
+            )
+        c = qualified[0]
+        if c.secType != "STK" or c.currency != spec.currency or c.symbol != symbol:
+            raise ContractError(
+                f"{symbol}: resolved to {c.secType} {c.symbol} {c.currency} "
+                f"(conId {c.conId}), expected a {spec.currency} stock"
+            )
         self._contract_cache[key] = c
         return c
 
@@ -255,6 +293,11 @@ class IbkrBroker(Broker):
             qty = _to_decimal(p.position)
             if qty == 0:
                 continue
+            if getattr(p.contract, "secType", "STK") != "STK":
+                # The bot only trades stocks. Surfacing an option or
+                # future here would let flatten_all() send a STOCK order
+                # for its underlying symbol.
+                continue
             sym = p.contract.symbol
             avg = _to_decimal(p.avgCost)
             mark = marks.get(p.contract.conId)
@@ -290,7 +333,7 @@ class IbkrBroker(Broker):
     async def quote(self, symbol: str) -> Quote:
         assert self._ib is not None
         await self._limiter.acquire("market_data")
-        contract = self._contract(symbol)
+        contract = await self._contract(symbol)
         ticker = self._ib.reqMktData(contract, "", False, False)
         try:
             # Wait up to ~2.5s for a tick. Outside market hours `last`
@@ -320,7 +363,7 @@ class IbkrBroker(Broker):
         ticker's prior close / day low and yesterday's daily bar."""
         assert self._ib is not None
         await self._limiter.acquire("market_data")
-        contract = self._contract(symbol)
+        contract = await self._contract(symbol)
         ticker = self._ib.reqMktData(contract, "236", False, False)
         try:
             for _ in range(50):
@@ -367,7 +410,7 @@ class IbkrBroker(Broker):
     ) -> list[Bar]:
         assert self._ib is not None
         await self._limiter.acquire("historical")
-        contract = self._contract(symbol)
+        contract = await self._contract(symbol)
         bars = await self._ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
@@ -398,7 +441,7 @@ class IbkrBroker(Broker):
         assert self._ib is not None
         await self._limiter.acquire("orders")
         ib_insync = self._ib_insync()
-        contract = self._contract(req.symbol, req.exchange, req.currency)
+        contract = await self._contract(req.symbol)
 
         if req.order_type == OrderType.MARKET:
             order = ib_insync.MarketOrder(req.side.value, float(req.qty))
