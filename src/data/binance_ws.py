@@ -7,9 +7,9 @@ updating the shared MarketData snapshots in real-time.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
-import json
 
 import websockets
 
