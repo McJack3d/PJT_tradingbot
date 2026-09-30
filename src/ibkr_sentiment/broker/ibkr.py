@@ -296,3 +296,10 @@ class IbkrBroker(Broker):
             if str(trade.order.orderId) == str(broker_order_id):
                 self._ib.cancelOrder(trade.order)
                 return
+
+    async def cancel_all_orders(self) -> None:
+        assert self._ib is not None
+        await self._limiter.acquire("generic")
+        # Global cancel covers orders from every client id, including
+        # ones placed before a restart that this session never saw.
+        self._ib.reqGlobalCancel()

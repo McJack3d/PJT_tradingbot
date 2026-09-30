@@ -246,3 +246,15 @@ class IbkrSentimentDB:
                 select(EquitySnapshotRow).order_by(EquitySnapshotRow.ts.desc()).limit(1)
             )
             return res.scalar_one_or_none()
+
+    async def first_equity_since(self, since: datetime) -> EquitySnapshotRow | None:
+        """Earliest equity snapshot at or after `since` — used to restore
+        the daily loss-stop anchor after a restart."""
+        async with self._session() as s:
+            res = await s.execute(
+                select(EquitySnapshotRow)
+                .where(EquitySnapshotRow.ts >= since)
+                .order_by(EquitySnapshotRow.ts.asc())
+                .limit(1)
+            )
+            return res.scalar_one_or_none()

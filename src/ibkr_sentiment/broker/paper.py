@@ -152,6 +152,10 @@ class PaperBroker(Broker):
         # Paper broker fills synchronously, so cancellation is a no-op.
         return None
 
+    async def cancel_all_orders(self) -> None:
+        # Paper broker fills synchronously, so nothing is ever resting.
+        pass
+
     def _apply_fill(self, symbol: str, signed_qty: Decimal, price: Decimal) -> None:
         cost = signed_qty * price
         self.cash -= cost

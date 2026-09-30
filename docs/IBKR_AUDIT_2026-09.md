@@ -50,9 +50,9 @@ numbers or silent degradation, **L** = hygiene.
 
 | # | Sev | Location | Defect |
 |---|---|---|---|
-| 1 | H | `risk/overlay.py` `check_target` | Gross/net caps are evaluated on the *whole basket* and the same verdict is applied to every delta — so one breach rejects **all** orders, including **closing** orders. Reproduced: 5 longs + closing an AAPL long → net 25% > 20% → AAPL close rejected. Risk-reducing orders must always pass. Also uses *target* notional on deltas instead of delta notional, and closes carry `notional=0`. |
-| 2 | H | `risk/overlay.py`, `bot.py` | `daily_pnl` is never passed to `check_account` and `daily_anchor` is never set → **daily loss stop never fires**. `trailing_stop_pct` and `max_orders_per_minute` are config-only, unused. |
-| 3 | H | `execution/engine.py` | Account halt returns an error but **does not flatten or cancel open orders**; next tick repeats. `emergency_flatten` is never called by anything. |
+| 1 | H ✅ fixed | `risk/overlay.py` `check_target` | Gross/net caps are evaluated on the *whole basket* and the same verdict is applied to every delta — so one breach rejects **all** orders, including **closing** orders. Reproduced: 5 longs + closing an AAPL long → net 25% > 20% → AAPL close rejected. Risk-reducing orders must always pass. Also uses *target* notional on deltas instead of delta notional, and closes carry `notional=0`. |
+| 2 | H ✅ fixed (daily stop; `trailing_stop_pct` / `max_orders_per_minute` still unused) | `risk/overlay.py`, `bot.py` | `daily_pnl` is never passed to `check_account` and `daily_anchor` is never set → **daily loss stop never fires**. `trailing_stop_pct` and `max_orders_per_minute` are config-only, unused. |
+| 3 | H ✅ fixed | `execution/engine.py` | Account halt returns an error but **does not flatten or cancel open orders**; next tick repeats. `emergency_flatten` is never called by anything. |
 | 4 | H | `broker/ibkr.py` `positions()` | `mark_price = avgCost` → gross/net exposure, equity snapshots and orphan checks all use cost, not market. Use `ib.portfolio()` (has `marketPrice`, `unrealizedPNL`). |
 | 5 | H | `broker/ibkr.py` `place_order` | Returns immediately after submit; no fill tracking, no partial-fill handling, no timeout/cancel. `record_trade` persists the *submitted* snapshot as a trade. No reconciliation of open orders/executions on restart → duplicate orders after a crash. |
 | 6 | H | `execution/engine.py` | Only `MARKET` orders, no market-hours check. Loop ticks every 60s 24/7: orders queue overnight and fire at the open auction gap. |
@@ -142,7 +142,10 @@ beta-neutral (not dollar-neutral) overlay.
 
 **Phase 0 — Safety (1–2 days)**
 - Revoke/scrub secret (§0); secret scan in CI.
-- Fix defects #1, #2, #3 with regression tests; set IBKR `mode: paper`
+- ✅ Fix defects #1, #2, #3 with regression tests (done: `check_basket`
+  replaces `check_target`; daily anchor persisted via equity snapshots;
+  latched halt cancels orders and flattens once).
+- Set IBKR `mode: paper`
   guard that refuses `live` unless an acceptance-gate file is present.
 
 **Phase 1 — Restructure (≈1 week)**

@@ -17,10 +17,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from src.ibkr_sentiment.broker.base import Broker
+from src.ibkr_sentiment.broker.base import AccountSummary, Broker
 from src.ibkr_sentiment.config import IbkrSentimentConfig
 from src.ibkr_sentiment.execution.engine import ExecutionEngine, RunResult
-from src.ibkr_sentiment.risk.overlay import RiskOverlay
+from src.ibkr_sentiment.risk.overlay import NEW_YORK, RiskOverlay, trading_day
 from src.ibkr_sentiment.sentiment.ingestion import IngestionService
 from src.ibkr_sentiment.sentiment.models import LLMVerdict, NewsItem, StructuredSignal
 from src.ibkr_sentiment.sentiment.pipeline import (
@@ -71,6 +71,7 @@ class IbkrSentimentBot:
 
     async def start(self) -> None:
         await self.db.init()
+        await self._restore_daily_anchor()
         if not await self.broker.is_connected():
             await self.broker.connect()
         if self.ingestion is not None:
@@ -82,6 +83,28 @@ class IbkrSentimentBot:
         if await self.broker.is_connected():
             await self.broker.disconnect()
         await self.db.close()
+
+    async def _restore_daily_anchor(self, now: datetime | None = None) -> None:
+        """Seed the daily loss-stop anchor from today's first equity
+        snapshot so a restart mid-session can't reset the daily stop."""
+        now = now or datetime.now(UTC)
+        day = trading_day(now)
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=NEW_YORK)
+        row = await self.db.first_equity_since(day_start)
+        if row is not None:
+            self.overlay.daily_anchor = row.net_liquidation
+            self.overlay.anchor_day = day
+
+    async def _record_equity(self, account: AccountSummary) -> None:
+        positions = await self.broker.positions()
+        await self.db.record_equity(
+            net_liquidation=account.net_liquidation,
+            gross_exposure=sum(
+                (abs(p.qty * p.mark_price) for p in positions), Decimal("0")
+            ),
+            net_exposure=sum((p.qty * p.mark_price for p in positions), Decimal("0")),
+            open_positions=len(positions),
+        )
 
     # ---- ingestion side ---------------------------------------------
 
@@ -124,6 +147,21 @@ class IbkrSentimentBot:
         else:
             fresh_signals = []
             report.notes.append("no_news_buffered")
+
+        # 1b. Account-level gate. Runs every tick — before any early
+        #     return — so a drawdown halts and flattens the book even
+        #     when no news arrives.
+        account = await self.broker.account_summary()
+        prev_day = self.overlay.anchor_day
+        self.overlay.roll_daily_anchor(account.net_liquidation, now)
+        if self.overlay.anchor_day != prev_day:
+            await self._record_equity(account)
+        halt_result = RunResult()
+        if not (await self.execution.enforce_account(account, halt_result)).ok:
+            report.execution = halt_result
+            report.fresh_signals = fresh_signals
+            report.notes.append("account_halt")
+            return report
 
         # 2. Trim the rolling verdict window.
         cutoff = now - self.pipeline.cfg.signal_window
@@ -190,7 +228,6 @@ class IbkrSentimentBot:
         await self.db.record_signals(signals)
 
         # 7. Build the dollar-neutral basket.
-        account = await self.broker.account_summary()
         min_qty = {u.symbol: u.min_qty for u in self.cfg.universe}
         sector_of = {
             u.symbol: u.sector_etf for u in self.cfg.universe if u.sector_etf
@@ -206,13 +243,13 @@ class IbkrSentimentBot:
         )
 
         # 8. Execute.
-        current_positions = {
-            p.symbol: p.qty for p in await self.broker.positions()
-        }
+        positions = await self.broker.positions()
+        current_positions = {p.symbol: p.qty for p in positions}
         result = await self.execution.execute_basket(
             targets,
             account=account,
             current_positions=current_positions,
+            marks={p.symbol: p.mark_price for p in positions},
         )
 
         # 9. Persist the resulting trades.
@@ -220,14 +257,7 @@ class IbkrSentimentBot:
             await self.db.record_trade(delta, placed)
 
         # 10. Equity snapshot.
-        gross = sum(abs(p.qty * p.mark_price) for p in await self.broker.positions())
-        net = sum(p.qty * p.mark_price for p in await self.broker.positions())
-        await self.db.record_equity(
-            net_liquidation=account.net_liquidation,
-            gross_exposure=Decimal(str(gross)),
-            net_exposure=Decimal(str(net)),
-            open_positions=len(current_positions),
-        )
+        await self._record_equity(account)
 
         report.decisions = symbol_decisions
         report.targets = targets

@@ -126,6 +126,11 @@ class Broker(ABC):
     @abstractmethod
     async def cancel_order(self, broker_order_id: str) -> None: ...
 
+    @abstractmethod
+    async def cancel_all_orders(self) -> None:
+        """Cancel every open order, including ones placed before a
+        restart."""
+
     async def flatten_all(self) -> list[OrderResult]:
         """Close every open position with market orders. Default
         implementation works for any broker that exposes `positions()`
