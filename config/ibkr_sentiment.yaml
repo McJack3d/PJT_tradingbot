@@ -2,7 +2,8 @@
 #
 #  mode: paper      — paper broker (in-process), pipeline runs end-to-end,
 #                     no IB connection required.
-#  mode: dry_run    — connects to IB Gateway, intercepts orders.
+#  mode: dry_run    — connects to IB Gateway READ-ONLY (no trading
+#                     permission needed); orders are logged, never sent.
 #  mode: live       — real money. Only after the backtest acceptance
 #                     gates from docs/IBKR_SENTIMENT.md pass.
 

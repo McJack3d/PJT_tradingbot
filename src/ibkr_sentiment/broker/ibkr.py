@@ -134,6 +134,10 @@ class ContractError(RuntimeError):
     pass
 
 
+class ReadOnlyBrokerError(RuntimeError):
+    """An order-changing call on a broker connected read-only (dry-run)."""
+
+
 @dataclass(slots=True)
 class ContractSpec:
     currency: str = "USD"
@@ -220,6 +224,12 @@ class IbkrBroker(Broker):
         return self._ib is not None and bool(self._ib.isConnected())
 
     # ---- helpers ----------------------------------------------------
+
+    def _require_writable(self, op: str) -> None:
+        # Second line of defence behind the engine's dry_run flag: a
+        # read-only session must never be able to touch orders.
+        if self.readonly:
+            raise ReadOnlyBrokerError(f"{op} refused: broker is connected read-only")
 
     async def _contract(self, symbol: str):
         """The IBKR-qualified stock contract for `symbol`, resolved once
@@ -439,6 +449,7 @@ class IbkrBroker(Broker):
 
     async def place_order(self, req: OrderRequest) -> OrderResult:
         assert self._ib is not None
+        self._require_writable("place_order")
         await self._limiter.acquire("orders")
         ib_insync = self._ib_insync()
         contract = await self._contract(req.symbol)
@@ -530,6 +541,7 @@ class IbkrBroker(Broker):
 
     async def cancel_order(self, broker_order_id: str) -> None:
         assert self._ib is not None
+        self._require_writable("cancel_order")
         await self._limiter.acquire("generic")
         for trade in list(self._ib.openTrades()):
             if str(trade.order.orderId) == str(broker_order_id):
@@ -538,6 +550,7 @@ class IbkrBroker(Broker):
 
     async def cancel_all_orders(self) -> None:
         assert self._ib is not None
+        self._require_writable("cancel_all_orders")
         await self._limiter.acquire("generic")
         # Global cancel covers orders from every client id, including
         # ones placed before a restart that this session never saw.

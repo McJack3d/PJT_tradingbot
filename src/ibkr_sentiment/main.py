@@ -69,7 +69,9 @@ async def _build_broker(cfg: IbkrSentimentConfig) -> Broker:
         port=cfg.ibkr.port,
         client_id=cfg.ibkr.client_id,
         account=cfg.ibkr.account or secrets.ibkr_account or None,
-        readonly=cfg.ibkr.readonly,
+        # Dry-run never needs trading permissions: connect read-only so
+        # IB Gateway itself rejects any order, whatever the bot does.
+        readonly=cfg.ibkr.readonly or cfg.mode == IbkrMode.DRY_RUN,
         connect_timeout_s=cfg.ibkr.connect_timeout_s,
         redis_url=cfg.rate_limit.redis_url or secrets.redis_url or None,
         orders_per_minute=cfg.rate_limit.orders_per_minute,

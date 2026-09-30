@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 class IbkrMode(str, Enum):
     BACKTEST = "backtest"
     PAPER = "paper"  # full pipeline, paper broker, no IB connection
-    DRY_RUN = "dry_run"  # full IB connection, intercept orders
+    DRY_RUN = "dry_run"  # read-only IB connection; orders logged, never sent
     LIVE = "live"
 
 
@@ -218,6 +218,12 @@ class IbkrSentimentConfig(BaseModel):
         if not v:
             raise ValueError("universe must contain at least one symbol")
         return v
+
+    @model_validator(mode="after")
+    def _live_needs_write_access(self) -> IbkrSentimentConfig:
+        if self.mode == IbkrMode.LIVE and self.ibkr.readonly:
+            raise ValueError("mode: live cannot run with ibkr.readonly: true")
+        return self
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> IbkrSentimentConfig:

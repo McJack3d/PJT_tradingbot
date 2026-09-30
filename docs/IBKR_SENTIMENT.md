@@ -109,7 +109,7 @@ tests/unit/test_ibkr_sentiment_*.py   unit tests
 | mode | broker | LLM | use case |
 | --- | --- | --- | --- |
 | `paper` (default) | in-memory `PaperBroker` | stub (deterministic) | quickstart, CI, full-pipeline smoke test |
-| `dry_run` | live IB Gateway connection | configured | full read path against IB, orders intercepted |
+| `dry_run` | read-only IB Gateway connection | configured | full read path against IB; orders logged, never sent (the broker refuses order calls) |
 | `live` | live IB Gateway connection | configured | real money, only after acceptance gates pass |
 
 ## Install
