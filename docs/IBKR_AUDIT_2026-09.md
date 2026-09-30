@@ -32,7 +32,7 @@ State at audit time: `main` @ `2d8ccea`, 464 unit tests passing
 
 | Area | Finding | Recommendation |
 |---|---|---|
-| Scope | Two unrelated bots + 4 crypto strategies (funding arb, carry, regime-switch perp, BTC SMA, BB squeeze). ~73% of `src/` is crypto. `pyproject` description still says "Funding-rate arbitrage bot for Binance". | Move crypto code to a `legacy-crypto` branch/tag, then delete from `main`. Promote `src/ibkr_sentiment/` to top-level package `ibkr_bot/`. |
+| Scope | Two unrelated bots + 5 crypto strategies (funding arb, carry, regime-switch perp, BTC SMA, BB squeeze). ~73% of `src/` is crypto. `pyproject` description still says "Funding-rate arbitrage bot for Binance". | Move crypto code to a `legacy-crypto` branch/tag, then delete from `main`. Promote `src/ibkr_sentiment/` to top-level package `ibkr_bot/`. |
 | Coupling | IBKR bot imports `src.logging_setup`, whose sibling `src.config` requires Binance settings; `ccxt`, `websockets` are hard deps. | IBKR package should have zero crypto imports; move `ccxt`, `python-telegram-bot` etc. into extras. |
 | Repo hygiene | Tracked: `.agents/` (agent orchestration scratch), `ORIGINAL_REQUEST.md`, `sandbox_test.py`, `.env.save`. | Remove or move to `docs/history/`. |
 | Naming | Bot is called "sentiment" but the proposed core is not sentiment-driven. | Rename to strategy-agnostic `ibkr_bot` with pluggable `strategies/`. |
