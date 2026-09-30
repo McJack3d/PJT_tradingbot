@@ -18,7 +18,6 @@ from src.risk.perp_guards import check_asset_cooloff, check_consecutive_losses
 from src.state.db import Database
 from src.state.models import SystemStatusEnum
 
-
 # =========================================================================
 # Bug 1: Cross-asset consecutive-losses sorting
 # =========================================================================
