@@ -96,8 +96,9 @@ def test_plist_contains_expected_fields(tmp_path: Path) -> None:
 
 def test_status_when_not_installed(tmp_path: Path, monkeypatch) -> None:
     import sys
+
     import src.scheduler
-    from src.scheduler import status, SchedulerPaths
+    from src.scheduler import SchedulerPaths, status
 
     def mock_paths(project_root: Path) -> SchedulerPaths:
         return SchedulerPaths(

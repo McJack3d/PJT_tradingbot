@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+
 import pandas as pd
 
 from src.adapters.binance import BinanceAdapter
@@ -16,8 +17,6 @@ from src.data.history import (
     _download_funding,
     _download_ohlcv,
     _ohlcv_to_df,
-    load_funding_async,
-    load_ohlcv_async,
 )
 
 
