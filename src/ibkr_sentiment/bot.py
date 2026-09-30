@@ -356,6 +356,7 @@ def build_default_bot(
         fill_timeout_s=cfg.fill_timeout_s,
         order_style=cfg.execution.order_style,
         limit_offset_bps=cfg.execution.limit_offset_bps,
+        short_policy=cfg.execution.short_policy(),
     )
     calendar = (
         MarketCalendar(

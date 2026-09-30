@@ -115,6 +115,7 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         fill_timeout_s=cfg.fill_timeout_s,
         order_style=cfg.execution.order_style,
         limit_offset_bps=cfg.execution.limit_offset_bps,
+        short_policy=cfg.execution.short_policy(),
     )
     universe_symbols = [u.symbol for u in cfg.universe]
     bot.ingestion = IngestionService(

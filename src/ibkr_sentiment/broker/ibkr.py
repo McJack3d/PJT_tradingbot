@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -31,6 +32,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderType,
     PositionView,
     Quote,
+    ShortInfo,
 )
 from src.ibkr_sentiment.broker.rate_limiter import (
     BucketSpec,
@@ -39,6 +41,8 @@ from src.ibkr_sentiment.broker.rate_limiter import (
     per_minute,
     per_window,
 )
+from src.ibkr_sentiment.risk.overlay import trading_day
+from src.ibkr_sentiment.risk.shorting import ssr_triggered
 from src.logging_setup import log
 
 
@@ -88,6 +92,27 @@ def _result_from_trade(trade: Any, *, fallback_client_id: str = "") -> OrderResu
         filled_qty=filled,
         avg_fill_price=_price(trade.orderStatus.avgFillPrice) or Decimal("0"),
     )
+
+
+def _shortable_level(ticker: Any) -> Decimal | None:
+    """IBKR's shortable indicator (generic tick 46). Newer clients expose
+    it as `ticker.shortable`; ib_insync 0.9.x only records it in
+    `ticker.ticks`."""
+    value = getattr(ticker, "shortable", None)
+    if value is None:
+        for t in reversed(getattr(ticker, "ticks", None) or []):
+            if getattr(t, "tickType", None) == 46:
+                value = t.price
+                break
+    if value is None or math.isnan(float(value)) or float(value) <= 0:
+        return None
+    return Decimal(str(value))
+
+
+def _bar_day(ts: Any) -> date:
+    if isinstance(ts, datetime):
+        return trading_day(ts if ts.tzinfo else ts.replace(tzinfo=UTC))
+    return ts
 
 
 def _status_from_ib(status: str) -> OrderStatus:
@@ -142,6 +167,8 @@ class IbkrBroker(Broker):
         )
         self._contract_cache: dict[str, Any] = {}
         self._trades: dict[str, Any] = {}  # broker order id -> ib Trade
+        # (symbol, NY trading day) -> Rule 201 carried over from yesterday
+        self._ssr_carry: dict[tuple[str, date], bool] = {}
 
     # ---- lazy SDK import --------------------------------------------
 
@@ -291,6 +318,54 @@ class IbkrBroker(Broker):
             ask=_price(ticker.ask) or zero,
             last=_price(ticker.last) or _price(ticker.close) or zero,
         )
+
+    async def short_availability(self, symbol: str) -> ShortInfo | None:
+        """Borrow data via generic tick 236 (shortable shares = tick 89,
+        shortable level = tick 46) plus Rule 201 state from the same
+        ticker's prior close / day low and yesterday's daily bar."""
+        assert self._ib is not None
+        await self._limiter.acquire("market_data")
+        contract = self._contract(symbol)
+        ticker = self._ib.reqMktData(contract, "236", False, False)
+        try:
+            for _ in range(50):
+                if _price(ticker.shortableShares) is not None or _shortable_level(ticker):
+                    break
+                await asyncio.sleep(self._quote_poll_s)
+        finally:
+            self._ib.cancelMktData(contract)
+        shares = ticker.shortableShares
+        shares_d = None if shares is None or math.isnan(float(shares)) else Decimal(str(shares))
+        level = _shortable_level(ticker)
+        if shares_d is None and level is None:
+            return None
+        ssr = ssr_triggered(
+            prev_close=_price(ticker.close),
+            day_low=_price(ticker.low),
+            last=_price(ticker.last),
+            carried_over=await self._ssr_carried_over(symbol),
+        )
+        return ShortInfo(
+            symbol=symbol, shortable_shares=shares_d, shortable_level=level, ssr_active=ssr
+        )
+
+    async def _ssr_carried_over(self, symbol: str) -> bool:
+        """True if Rule 201 triggered on the previous session (it stays
+        in force for the whole next day). Cached per symbol per day."""
+        today = trading_day(datetime.now(UTC))
+        key = (symbol, today)
+        if key not in self._ssr_carry:
+            try:
+                bars = await self.historical_bars(symbol, duration="5 D", bar_size="1 day")
+            except Exception as e:
+                log.warning("ibkr.ssr.bars_error", symbol=symbol, error=str(e))
+                return False  # don't cache a failure
+            done = [b for b in bars if _bar_day(b.ts) < today]
+            carried = len(done) >= 2 and ssr_triggered(
+                prev_close=done[-2].close, day_low=done[-1].low, last=None
+            )
+            self._ssr_carry[key] = carried
+        return self._ssr_carry[key]
 
     async def historical_bars(
         self, symbol: str, duration: str = "60 D", bar_size: str = "1 day"

@@ -30,6 +30,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderType,
     PositionView,
     Quote,
+    ShortInfo,
 )
 
 
@@ -52,6 +53,7 @@ class PaperBroker(Broker):
         self._orders: dict[str, OrderResult] = {}
         # Non-marketable LIMIT orders: broker id -> (request, live result)
         self._resting: dict[str, tuple[OrderRequest, OrderResult]] = {}
+        self._short_info: dict[str, ShortInfo | None] = {}
         self._lock = asyncio.Lock()
 
     # ---- lifecycle ---------------------------------------------------
@@ -181,6 +183,23 @@ class PaperBroker(Broker):
 
     async def order_status(self, client_order_id: str) -> OrderResult | None:
         return self._orders.get(client_order_id)
+
+    async def short_availability(self, symbol: str) -> ShortInfo | None:
+        # Paper default: easy to borrow, no restriction. Tests override
+        # per symbol with set_short_info().
+        return self._short_info.get(
+            symbol,
+            ShortInfo(
+                symbol=symbol,
+                shortable_shares=Decimal("1000000"),
+                shortable_level=Decimal("3"),
+                ssr_active=False,
+            ),
+        )
+
+    def set_short_info(self, info: ShortInfo | None, symbol: str | None = None) -> None:
+        """Test helper: pass `info=None, symbol=...` to simulate unknown data."""
+        self._short_info[symbol or info.symbol] = info  # type: ignore[union-attr]
 
     async def open_orders(self) -> list[OpenOrderView]:
         return [

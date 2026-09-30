@@ -20,6 +20,11 @@ basket builder) and routes them to the broker. Respects:
     touch +/- `limit_offset_bps` from a fresh quote so no fill can be
     worse than that; `adaptive` (IBKR Adaptive algo) and `market` are
     opt-in. Emergency flattening always uses market orders.
+  * Short-sale checks — any delta that sells below zero needs borrow
+    (IBKR shortable shares / level) and no Rule 201 restriction. A
+    blocked short is dropped BEFORE the gross/net checks so the rest of
+    the basket is re-balanced around it; a blocked long->short flip is
+    trimmed to just closing the long.
   * `dry_run` mode — orders are logged, never sent.
   * IBKR pacing — the broker's own rate limiter is what we rely on; the
     engine does not double-count.
@@ -45,6 +50,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderType,
 )
 from src.ibkr_sentiment.risk.overlay import RiskOverlay, RiskVerdict
+from src.ibkr_sentiment.risk.shorting import ShortPolicy, evaluate_short, short_sale_qty
 from src.ibkr_sentiment.signal_engine.dollar_neutral import (
     TargetPosition,
     diff_targets,
@@ -82,6 +88,7 @@ class ExecutionEngine:
     cancel_confirm_timeout_s: float = 5.0
     order_style: str = "limit"  # limit | adaptive | market
     limit_offset_bps: Decimal = Decimal("10")
+    short_policy: ShortPolicy = field(default_factory=ShortPolicy)
 
     async def enforce_account(
         self, account: AccountSummary, result: RunResult
@@ -121,6 +128,7 @@ class ExecutionEngine:
             if t.target_qty != 0 and t.notional > 0:
                 prices[t.symbol] = t.notional / abs(t.target_qty)
         deltas = diff_targets(current_positions, targets)
+        deltas = await self._filter_short_sales(deltas, current_positions, result)
         approved: list[TargetPosition] = []
         for d, verdict in self.overlay.check_basket(
             deltas,
@@ -153,6 +161,42 @@ class ExecutionEngine:
         )
         result.placed.extend(zip((d for d, _ in submitted), finals, strict=True))
         return result
+
+    async def _filter_short_sales(
+        self,
+        deltas: list[TargetPosition],
+        current_positions: dict[str, Decimal],
+        result: RunResult,
+    ) -> list[TargetPosition]:
+        kept: list[TargetPosition] = []
+        for d in deltas:
+            cur = current_positions.get(d.symbol, Decimal("0"))
+            qty = short_sale_qty(cur, d.target_qty)
+            if qty <= 0:
+                kept.append(d)
+                continue
+            try:
+                info = await self.broker.short_availability(d.symbol)
+            except Exception as e:
+                result.errors.append((d.symbol, f"short availability {type(e).__name__}: {e}"))
+                info = None
+            verdict = evaluate_short(info, qty, self.short_policy)
+            if verdict.ok:
+                kept.append(d)
+                continue
+            result.rejected_by_risk.append((d, verdict.reason))
+            if cur > 0:
+                # Still close the long; only the short leg is blocked.
+                kept.append(
+                    TargetPosition(
+                        symbol=d.symbol,
+                        side=d.side,
+                        target_qty=-cur,
+                        notional=Decimal("0"),
+                        reason=f"{d.reason}; short leg blocked: {verdict.reason}",
+                    )
+                )
+        return kept
 
     async def _await_final(
         self, delta: TargetPosition, order: OrderResult, result: RunResult

@@ -106,6 +106,17 @@ class OrderResult:
 
 
 @dataclass(slots=True)
+class ShortInfo:
+    """Borrow / short-sale snapshot for one symbol. None = unknown."""
+
+    symbol: str
+    shortable_shares: Decimal | None
+    # IBKR shortable indicator: > 2.5 easy, 1.5-2.5 hard to borrow, < 1.5 none.
+    shortable_level: Decimal | None
+    ssr_active: bool
+
+
+@dataclass(slots=True)
 class OpenOrderView:
     client_order_id: str  # IBKR orderRef; "" for orders placed outside the bot
     broker_order_id: str
@@ -156,6 +167,10 @@ class Broker(ABC):
     @abstractmethod
     async def open_orders(self) -> list[OpenOrderView]:
         """Every working order on the account, ours or not."""
+
+    @abstractmethod
+    async def short_availability(self, symbol: str) -> ShortInfo | None:
+        """Borrow availability and Rule 201 state, or None if unknown."""
 
     @abstractmethod
     async def cancel_all_orders(self) -> None:

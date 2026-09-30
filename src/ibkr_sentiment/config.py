@@ -10,11 +10,14 @@ from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from src.ibkr_sentiment.risk.shorting import ShortPolicy
 
 
 class IbkrMode(str, Enum):
@@ -147,6 +150,24 @@ class ExecutionConfig(BaseModel):
     # market:   plain market order.
     order_style: Literal["limit", "adaptive", "market"] = "limit"
     limit_offset_bps: Decimal = Decimal("10")
+    # Short sales: require borrow (IBKR shortable shares >= multiple x
+    # order size, easy-to-borrow unless allowed) and no Rule 201 SSR.
+    # Missing borrow data blocks the short (fails closed).
+    short_check_enabled: bool = True
+    allow_hard_to_borrow: bool = False
+    min_shortable_multiple: Decimal = Decimal("2")
+    block_shorts_under_ssr: bool = True
+
+    def short_policy(self) -> ShortPolicy:
+        # Local import: risk.shorting -> risk.overlay -> config.
+        from src.ibkr_sentiment.risk.shorting import ShortPolicy
+
+        return ShortPolicy(
+            enabled=self.short_check_enabled,
+            allow_hard_to_borrow=self.allow_hard_to_borrow,
+            min_shortable_multiple=self.min_shortable_multiple,
+            block_under_ssr=self.block_shorts_under_ssr,
+        )
 
 
 class IbkrSentimentConfig(BaseModel):
