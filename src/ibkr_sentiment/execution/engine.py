@@ -115,6 +115,7 @@ class ExecutionEngine:
         account: AccountSummary,
         current_positions: dict[str, Decimal],
         marks: dict[str, Decimal] | None = None,
+        betas: dict[str, Decimal] | None = None,
     ) -> RunResult:
         """`marks` are current market prices for held symbols; prices
         for symbols in `targets` are derived from the targets
@@ -135,6 +136,7 @@ class ExecutionEngine:
             nlv=account.net_liquidation,
             current_positions=current_positions,
             prices=prices,
+            betas=betas,
         ):
             if not verdict.ok:
                 result.rejected_by_risk.append((d, verdict.reason))

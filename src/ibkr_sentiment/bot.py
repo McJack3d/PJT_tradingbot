@@ -30,6 +30,7 @@ from src.ibkr_sentiment.sentiment.pipeline import (
     SentimentPipeline,
     aggregate_signals,
 )
+from src.ibkr_sentiment.signal_engine.beta import estimate_beta
 from src.ibkr_sentiment.signal_engine.dollar_neutral import (
     TargetPosition,
     build_dollar_neutral_basket,
@@ -126,6 +127,28 @@ class IbkrSentimentBot:
                 await self.db.update_trade(latest)
         self.startup_reconciliation = report
         return report
+
+    async def _betas(self, symbols: list[str], now: datetime) -> dict[str, Decimal]:
+        """Blume-adjusted betas vs the benchmark from cached daily bars.
+        Symbols without enough history are omitted (treated as beta 1)."""
+        assert self.bar_cache is not None
+        if not symbols:
+            return {}
+        risk = self.cfg.risk
+        try:
+            bench = await self.bar_cache.get(risk.beta_benchmark, now)
+        except Exception:
+            return {}
+        out: dict[str, Decimal] = {}
+        for sym in symbols:
+            try:
+                bars = await self.bar_cache.get(sym, now)
+            except Exception:
+                continue
+            beta = estimate_beta(bars, bench, lookback=risk.beta_lookback_days)
+            if beta is not None:
+                out[sym] = beta
+        return out
 
     async def _restore_daily_anchor(self, now: datetime | None = None) -> None:
         """Seed the daily loss-stop anchor from today's first equity
@@ -279,7 +302,10 @@ class IbkrSentimentBot:
                 report.notes.append(f"market_closed: {window.reason}")
                 return report
 
-        # 7. Build the dollar-neutral basket.
+        # 7. Build the market-neutral basket (beta-balanced by default).
+        betas: dict[str, Decimal] | None = None
+        if self.cfg.risk.neutrality == "beta":
+            betas = await self._betas([d.symbol for d in symbol_decisions], now)
         min_qty = {u.symbol: u.min_qty for u in self.cfg.universe}
         sector_of = {
             u.symbol: u.sector_etf for u in self.cfg.universe if u.sector_etf
@@ -292,6 +318,7 @@ class IbkrSentimentBot:
             min_qty=min_qty,
             sector_of=sector_of or None,
             max_sector_pct=self.cfg.risk.max_sector_pct,
+            betas=betas,
         )
 
         # 8. Execute. Cancel our own leftover working orders first so
@@ -300,11 +327,16 @@ class IbkrSentimentBot:
         await self.execution.cancel_stale_orders(pre)
         positions = await self.broker.positions()
         current_positions = {p.symbol: p.qty for p in positions}
+        if betas is not None:
+            # Held names without a signal still count in the net check.
+            held = [p.symbol for p in positions if p.symbol not in betas]
+            betas.update(await self._betas(held, now))
         result = await self.execution.execute_basket(
             targets,
             account=account,
             current_positions=current_positions,
             marks={p.symbol: p.mark_price for p in positions},
+            betas=betas,
         )
         result.stale_cancelled = pre.stale_cancelled
         result.foreign_open_orders = pre.foreign_open_orders

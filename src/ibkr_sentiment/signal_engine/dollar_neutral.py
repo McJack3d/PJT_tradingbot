@@ -43,6 +43,65 @@ def _quantize(qty: Decimal, step: Decimal) -> Decimal:
     return n * step
 
 
+def _scale(
+    t: TargetPosition, factor: Decimal, min_qty: dict[str, Decimal], label: str
+) -> TargetPosition | None:
+    """Scale a target DOWN by `factor`, flooring |qty| to the symbol's lot
+    step (rounding toward zero, so a cap is never exceeded). None if it
+    rounds to nothing."""
+    qty = _quantize(abs(t.target_qty) * factor, min_qty.get(t.symbol, Decimal("1")))
+    if qty <= 0:
+        return None
+    price = t.notional / abs(t.target_qty)
+    return TargetPosition(
+        symbol=t.symbol,
+        side=t.side,
+        target_qty=qty if t.target_qty > 0 else -qty,
+        notional=qty * price,
+        reason=t.reason + f"; {label} x{float(factor):.2f}",
+    )
+
+
+def _beta_balance(
+    targets: list[TargetPosition],
+    betas: dict[str, Decimal],
+    min_qty: dict[str, Decimal],
+) -> list[TargetPosition]:
+    one = Decimal("1")
+    longs = [t for t in targets if t.target_qty > 0]
+    shorts = [t for t in targets if t.target_qty < 0]
+    beta_long = sum((t.notional * betas.get(t.symbol, one) for t in longs), Decimal("0"))
+    beta_short = sum((t.notional * betas.get(t.symbol, one) for t in shorts), Decimal("0"))
+    if beta_long <= 0 or beta_short <= 0 or beta_long == beta_short:
+        return targets  # one-sided books are capped elsewhere
+    heavy = longs if beta_long > beta_short else shorts
+    factor = min(beta_long, beta_short) / max(beta_long, beta_short)
+    heavy_syms = {t.symbol for t in heavy}
+    out: list[TargetPosition] = []
+    for t in targets:
+        if t.symbol in heavy_syms:
+            scaled = _scale(t, factor, min_qty, "beta-balance")
+            if scaled is not None:
+                out.append(scaled)
+        else:
+            out.append(t)
+    return out
+
+
+def beta_exposure(
+    targets: Iterable[TargetPosition], betas: dict[str, Decimal]
+) -> Decimal:
+    """Signed beta-weighted notional of a set of targets."""
+    return sum(
+        (
+            t.notional * betas.get(t.symbol, Decimal("1")) * (1 if t.target_qty > 0 else -1)
+            for t in targets
+            if t.target_qty != 0
+        ),
+        Decimal("0"),
+    )
+
+
 def build_dollar_neutral_basket(
     decisions: Iterable[SymbolDecision],
     *,
@@ -52,6 +111,7 @@ def build_dollar_neutral_basket(
     min_qty: dict[str, Decimal] | None = None,
     sector_of: dict[str, str] | None = None,
     max_sector_pct: Decimal | None = None,
+    betas: dict[str, Decimal] | None = None,
 ) -> list[TargetPosition]:
     """Convert decisions → target positions, respecting caps.
 
@@ -59,6 +119,12 @@ def build_dollar_neutral_basket(
     Symbols absent from `min_qty` quantize to 1 share. Sector caps are
     applied AFTER per-name sizing (anything over the sector cap gets
     proportionally trimmed).
+
+    With `betas`, the legs are then balanced on BETA-weighted notional
+    instead of dollars: the leg with more beta-dollars is scaled down
+    until sum(beta * long $) ~= sum(beta * short $). Scaling only ever
+    shrinks positions, so every cap above still holds. Symbols missing
+    from `betas` count as beta 1.
     """
     min_qty = min_qty or {}
     sector_of = sector_of or {}
@@ -144,19 +210,15 @@ def build_dollar_neutral_basket(
             for t in targets:
                 sec = sector_of.get(t.symbol)
                 if sec in scale:
-                    s = scale[sec]
-                    scaled.append(
-                        TargetPosition(
-                            symbol=t.symbol,
-                            side=t.side,
-                            target_qty=(t.target_qty * s).quantize(Decimal("1")),
-                            notional=(t.notional * s),
-                            reason=t.reason + f"; sector-trim x{float(s):.2f}",
-                        )
-                    )
+                    trimmed = _scale(t, scale[sec], min_qty, "sector-trim")
+                    if trimmed is not None:
+                        scaled.append(trimmed)
                 else:
                     scaled.append(t)
             targets = scaled
+
+    if betas is not None:
+        targets = _beta_balance(targets, betas, min_qty)
 
     # Emit zero targets for FLAT symbols so the execution engine knows
     # to close any open position in them.

@@ -6,7 +6,9 @@ IBKR's pacing limit of ~60 per 10 minutes, for data that changes once a
 day. The cache fetches the full history once, then refreshes with a
 small incremental request ("2 D": yesterday + today's partial bar) at
 most every `refresh`, and always on a new trading day. A failed refresh
-serves the last good bars rather than dropping the symbol.
+serves the last good bars rather than dropping the symbol. An empty
+result (unknown symbol, no data permission) is remembered and retried
+at most every `empty_retry`, so a bad symbol can't burn pacing either.
 """
 
 from __future__ import annotations
@@ -38,17 +40,19 @@ class BarCache:
     full_duration: str = "120 D"
     refresh_duration: str = "2 D"
     refresh: timedelta = timedelta(minutes=60)
+    empty_retry: timedelta = timedelta(minutes=15)
     requests: int = 0  # historical requests issued (diagnostics / tests)
     _entries: dict[str, _Entry] = field(default_factory=dict)
 
     async def get(self, symbol: str, now: datetime) -> list[Bar]:
         entry = self._entries.get(symbol)
         day = trading_day(now)
-        if entry is None:
+        if entry is None or (not entry.bars and now - entry.fetched_at >= self.empty_retry):
             bars = await self._fetch(symbol, self.full_duration)
-            if bars:
-                self._entries[symbol] = _Entry(bars, now, day)
+            self._entries[symbol] = _Entry(bars, now, day)
             return bars
+        if not entry.bars:
+            return []
         if day == entry.day and now - entry.fetched_at < self.refresh:
             return entry.bars
         try:

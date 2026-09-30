@@ -93,13 +93,14 @@ async def test_failed_refresh_serves_stale_bars():
 
 
 @pytest.mark.asyncio
-async def test_empty_first_fetch_is_not_cached():
+async def test_empty_fetch_is_retried_only_after_empty_retry():
     b = _Broker()
     b.responses["120 D"] = []
     cache = BarCache(b)
     assert await cache.get("AAPL", T0) == []
     b.responses["120 D"] = _history()
-    assert len(await cache.get("AAPL", T0)) == 3
+    assert await cache.get("AAPL", T0 + timedelta(minutes=14)) == []  # remembered
+    assert len(await cache.get("AAPL", T0 + timedelta(minutes=15))) == 3
     assert b.calls == ["120 D", "120 D"]
 
 
@@ -132,6 +133,7 @@ async def test_bot_ticks_reuse_cached_bars(tmp_path: Path):
                 )
             )
             await bot.tick()
-        assert calls == ["AAPL"]  # one fetch across three ticks
+        # One fetch per symbol across three ticks (SPY = beta benchmark).
+        assert sorted(calls) == ["AAPL", "SPY"]
     finally:
         await bot.stop()

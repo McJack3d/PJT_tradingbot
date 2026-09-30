@@ -132,6 +132,11 @@ class RiskOverlayConfig(BaseModel):
     max_gross_exposure_pct: Decimal = Decimal("1.50")  # 150% gross
     max_net_exposure_pct: Decimal = Decimal("0.20")  # 20% net (close to dollar-neutral)
     max_position_pct: Decimal = Decimal("0.05")  # 5% of equity per name
+    # beta: balance legs and cap net on beta-weighted exposure vs the
+    #       benchmark (true market neutrality). dollar: legacy behaviour.
+    neutrality: Literal["beta", "dollar"] = "beta"
+    beta_benchmark: str = "SPY"
+    beta_lookback_days: int = 60
     max_sector_pct: Decimal = Decimal("0.30")
     daily_loss_stop_pct: Decimal = Decimal("0.02")
     cumulative_loss_stop_pct: Decimal = Decimal("0.10")

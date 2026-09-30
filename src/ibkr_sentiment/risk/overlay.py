@@ -131,6 +131,7 @@ class RiskOverlay:
         nlv: Decimal,
         current_positions: dict[str, Decimal],
         prices: dict[str, Decimal],
+        betas: dict[str, Decimal] | None = None,
     ) -> list[tuple[TargetPosition, RiskVerdict]]:
         """Approve or veto each order delta against the current book.
 
@@ -142,8 +143,17 @@ class RiskOverlay:
           repeatedly, until the book fits (or only risk-reducing
           deltas remain). One breach never vetoes the whole basket.
 
+        With `betas`, the net cap applies to BETA-weighted net exposure
+        (sum of qty * price * beta; missing betas count as 1): a
+        beta-neutral book is deliberately not dollar-neutral.
+
         Returns one (delta, verdict) pair per input delta, in order.
         """
+        one = Decimal("1")
+
+        def weight(sym: str) -> Decimal:
+            return prices.get(sym, Decimal("0")) * (betas.get(sym, one) if betas else one)
+
         deltas = list(deltas)
         verdicts: dict[int, RiskVerdict] = {}
         if nlv <= 0:
@@ -191,9 +201,7 @@ class RiskOverlay:
                 (abs(q * prices.get(s, Decimal("0"))) for s, q in qty.items()),
                 Decimal("0"),
             )
-            net = sum(
-                (q * prices.get(s, Decimal("0")) for s, q in qty.items()), Decimal("0")
-            )
+            net = sum((q * weight(s) for s, q in qty.items()), Decimal("0"))
             # Deltas pushing net further from zero are removed first, so
             # trimming for either cap keeps the book balanced.
             sign = 1 if net > 0 else -1
@@ -202,7 +210,8 @@ class RiskOverlay:
                 breach = f"proposed gross {gross} > gross cap {gross_cap}"
                 candidates = same_side if net != 0 and same_side else increasing
             elif abs(net) > net_cap:
-                breach = f"proposed net {net} > net cap ±{net_cap}"
+                label = "beta-weighted net" if betas else "net"
+                breach = f"proposed {label} {net} > net cap ±{net_cap}"
                 candidates = same_side
             else:
                 break
@@ -210,7 +219,7 @@ class RiskOverlay:
                 break
             worst = max(
                 candidates,
-                key=lambda i: abs(deltas[i].target_qty * prices[deltas[i].symbol]),
+                key=lambda i: abs(deltas[i].target_qty * weight(deltas[i].symbol)),
             )
             verdicts[worst] = RiskVerdict(False, breach)
             increasing.remove(worst)

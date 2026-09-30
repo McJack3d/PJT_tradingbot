@@ -101,6 +101,11 @@ signal:
 
 risk:
   starting_equity_usd: "100000"
+  # beta: size legs so beta-weighted long == short vs the benchmark, and
+  # apply max_net_exposure_pct to beta-weighted net. dollar: legacy.
+  neutrality: beta
+  beta_benchmark: SPY          # market data only; never traded
+  beta_lookback_days: 60
   max_gross_exposure_pct: "1.50"
   max_net_exposure_pct: "0.20"
   max_position_pct: "0.05"
