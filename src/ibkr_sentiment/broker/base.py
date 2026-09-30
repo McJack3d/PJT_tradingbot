@@ -90,6 +90,7 @@ class OrderRequest:
     trail_percent: Decimal | None = None
     client_order_id: str = ""
     tif: str = "DAY"
+    algo: str | None = None  # e.g. "Adaptive" (IBKR algo strategy)
     exchange: str = "SMART"
     currency: str = "USD"
 

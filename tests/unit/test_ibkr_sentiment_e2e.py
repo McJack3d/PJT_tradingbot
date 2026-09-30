@@ -17,6 +17,7 @@ from src.ibkr_sentiment.bot import build_default_bot
 from src.ibkr_sentiment.broker.base import Bar
 from src.ibkr_sentiment.broker.paper import PaperBroker
 from src.ibkr_sentiment.config import (
+    ExecutionConfig,
     FinBertConfig,
     IbkrMode,
     IbkrSentimentConfig,
@@ -73,6 +74,9 @@ def _make_cfg() -> IbkrSentimentConfig:
             max_net_exposure_pct=Decimal("0.5"),  # loose for the test
             max_position_pct=Decimal("0.25"),
         ),
+        # These tests tick on the wall clock; the hours gate has its own
+        # tests in test_ibkr_market_hours.py.
+        execution=ExecutionConfig(enforce_market_hours=False),
         db_url="sqlite+aiosqlite:///:memory:",
     )
 

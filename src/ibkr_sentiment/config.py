@@ -10,7 +10,7 @@ from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -134,6 +134,21 @@ class RiskOverlayConfig(BaseModel):
     max_orders_per_minute: int = 20
 
 
+class ExecutionConfig(BaseModel):
+    # Only send new orders inside the NYSE regular session, minus the
+    # buffers below (holidays and early closes come from the calendar).
+    enforce_market_hours: bool = True
+    open_buffer_minutes: int = 5
+    close_buffer_minutes: int = 10
+    # limit:    marketable limit at the touch +/- limit_offset_bps
+    #           (default; caps slippage, unfilled remainder is cancelled
+    #           after fill_timeout_s).
+    # adaptive: IBKR Adaptive algo market order (PaperBroker: market).
+    # market:   plain market order.
+    order_style: Literal["limit", "adaptive", "market"] = "limit"
+    limit_offset_bps: Decimal = Decimal("10")
+
+
 class IbkrSentimentConfig(BaseModel):
     """Top-level config tree."""
 
@@ -147,6 +162,7 @@ class IbkrSentimentConfig(BaseModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     signal: SignalConfig = Field(default_factory=SignalConfig)
     risk: RiskOverlayConfig = Field(default_factory=RiskOverlayConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     tick_seconds: int = 60  # main loop cadence
     # Max wait for an order to fill before its remainder is cancelled.
     fill_timeout_s: float = 30.0

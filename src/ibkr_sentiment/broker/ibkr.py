@@ -351,6 +351,9 @@ class IbkrBroker(Broker):
             raise ValueError(f"unsupported order type: {req.order_type}")
 
         order.tif = req.tif
+        if req.algo:
+            order.algoStrategy = req.algo
+            order.algoParams = [ib_insync.TagValue("adaptivePriority", "Normal")]
         if req.client_order_id:
             # IBKR doesn't take an arbitrary client-order-id like Binance,
             # but we set `orderRef` so the bot's own logs can join back.

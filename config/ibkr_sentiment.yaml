@@ -110,6 +110,13 @@ risk:
   trailing_stop_pct: "0.05"
   max_orders_per_minute: 20
 
+execution:
+  enforce_market_hours: true   # only trade in the NYSE regular session
+  open_buffer_minutes: 5       # skip the opening auction / widest spreads
+  close_buffer_minutes: 10     # don't leave orders working into the close
+  order_style: limit           # limit | adaptive | market
+  limit_offset_bps: "10"       # marketable limit = touch +/- 10 bps
+
 tick_seconds: 60
 fill_timeout_s: 30   # cancel any unfilled remainder after this many seconds
 db_url: sqlite+aiosqlite:///data/ibkr_sentiment.db

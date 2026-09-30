@@ -50,6 +50,8 @@ class PaperBroker(Broker):
         # symbol -> (qty, avg_cost)
         self._positions: dict[str, tuple[Decimal, Decimal]] = {}
         self._orders: dict[str, OrderResult] = {}
+        # Non-marketable LIMIT orders: broker id -> (request, live result)
+        self._resting: dict[str, tuple[OrderRequest, OrderResult]] = {}
         self._lock = asyncio.Lock()
 
     # ---- lifecycle ---------------------------------------------------
@@ -126,17 +128,31 @@ class PaperBroker(Broker):
             client_id = req.client_order_id or uuid4().hex
             broker_id = f"P-{uuid4().hex[:10]}"
             quote = await self.quote(req.symbol)
-            # Market order: fill at mid + slippage in the trade direction.
-            if req.order_type == OrderType.MARKET:
-                mid = (quote.bid + quote.ask) / 2 if quote.ask else quote.last
-                bps = self.slippage_bps / Decimal("10000")
-                if req.side == OrderSide.BUY:
-                    fill_price = mid * (Decimal("1") + bps)
-                else:
-                    fill_price = mid * (Decimal("1") - bps)
-            else:
-                fill_price = (
-                    req.limit_price if req.limit_price is not None else quote.last
+            # Fill at mid + slippage in the trade direction. A LIMIT
+            # order fills only if marketable (buy limit >= ask, sell
+            # limit <= bid), never through its limit; otherwise it rests
+            # until cancelled — like a real book, without partials.
+            mid = (quote.bid + quote.ask) / 2 if quote.ask else quote.last
+            bps = self.slippage_bps / Decimal("10000")
+            buy = req.side == OrderSide.BUY
+            fill_price = mid * (Decimal("1") + bps if buy else Decimal("1") - bps)
+            if req.order_type == OrderType.LIMIT and req.limit_price is not None:
+                touch = (quote.ask or quote.last) if buy else (quote.bid or quote.last)
+                marketable = req.limit_price >= touch if buy else req.limit_price <= touch
+                if not marketable:
+                    resting = OrderResult(
+                        client_order_id=client_id,
+                        broker_order_id=broker_id,
+                        status=OrderStatus.SUBMITTED,
+                        filled_qty=Decimal("0"),
+                        avg_fill_price=Decimal("0"),
+                        submitted_at=datetime.now(UTC),
+                    )
+                    self._orders[client_id] = resting
+                    self._resting[broker_id] = (req, resting)
+                    return resting
+                fill_price = min(fill_price, req.limit_price) if buy else max(
+                    fill_price, req.limit_price
                 )
             qty = req.qty if req.side == OrderSide.BUY else -req.qty
             self._apply_fill(req.symbol, qty, fill_price)
@@ -152,12 +168,13 @@ class PaperBroker(Broker):
             return result
 
     async def cancel_order(self, broker_order_id: str) -> None:
-        # Paper broker fills synchronously, so cancellation is a no-op.
-        return None
+        entry = self._resting.pop(broker_order_id, None)
+        if entry is not None:
+            entry[1].status = OrderStatus.CANCELED
 
     async def cancel_all_orders(self) -> None:
-        # Paper broker fills synchronously, so nothing is ever resting.
-        pass
+        for broker_id in list(self._resting):
+            await self.cancel_order(broker_id)
 
     async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
         return self._orders.get(order.client_order_id, order)
@@ -166,7 +183,15 @@ class PaperBroker(Broker):
         return self._orders.get(client_order_id)
 
     async def open_orders(self) -> list[OpenOrderView]:
-        return []
+        return [
+            OpenOrderView(
+                client_order_id=res.client_order_id,
+                broker_order_id=broker_id,
+                symbol=req.symbol,
+                remaining_qty=req.qty if req.side == OrderSide.BUY else -req.qty,
+            )
+            for broker_id, (req, res) in self._resting.items()
+        ]
 
     def _apply_fill(self, symbol: str, signed_qty: Decimal, price: Decimal) -> None:
         cost = signed_qty * price

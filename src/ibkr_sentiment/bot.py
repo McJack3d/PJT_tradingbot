@@ -20,6 +20,7 @@ from decimal import Decimal
 from src.ibkr_sentiment.broker.base import AccountSummary, Broker
 from src.ibkr_sentiment.config import IbkrSentimentConfig
 from src.ibkr_sentiment.execution.engine import ExecutionEngine, RunResult
+from src.ibkr_sentiment.market_hours import MarketCalendar
 from src.ibkr_sentiment.risk.overlay import NEW_YORK, RiskOverlay, trading_day
 from src.ibkr_sentiment.sentiment.ingestion import IngestionService
 from src.ibkr_sentiment.sentiment.models import LLMVerdict, NewsItem, StructuredSignal
@@ -59,6 +60,8 @@ class IbkrSentimentBot:
     db: IbkrSentimentDB
     ingestion: IngestionService | None = None
     startup_reconciliation: RunResult | None = None
+    # None disables the market-hours gate (tests, or 24h instruments).
+    calendar: MarketCalendar | None = None
 
     # Items that arrived since the last tick. Flushed at the top of
     # `tick()`. Keeping a small buffer rather than firing inference on
@@ -258,6 +261,16 @@ class IbkrSentimentBot:
                 sig.technical_reason = d.technical_reason
         await self.db.record_signals(signals)
 
+        # 6b. Market-hours gate. Signals are recorded above either way;
+        #     orders only go out inside the NYSE trading window.
+        if self.calendar is not None:
+            window = self.calendar.window(now)
+            if not window.open:
+                report.decisions = symbol_decisions
+                report.fresh_signals = fresh_signals
+                report.notes.append(f"market_closed: {window.reason}")
+                return report
+
         # 7. Build the dollar-neutral basket.
         min_qty = {u.symbol: u.min_qty for u in self.cfg.universe}
         sector_of = {
@@ -338,7 +351,19 @@ def build_default_bot(
             cfg=cfg.risk, starting_equity=cfg.risk.starting_equity_usd
         )
     execution = ExecutionEngine(
-        broker=broker, overlay=overlay, fill_timeout_s=cfg.fill_timeout_s
+        broker=broker,
+        overlay=overlay,
+        fill_timeout_s=cfg.fill_timeout_s,
+        order_style=cfg.execution.order_style,
+        limit_offset_bps=cfg.execution.limit_offset_bps,
+    )
+    calendar = (
+        MarketCalendar(
+            open_buffer=timedelta(minutes=cfg.execution.open_buffer_minutes),
+            close_buffer=timedelta(minutes=cfg.execution.close_buffer_minutes),
+        )
+        if cfg.execution.enforce_market_hours
+        else None
     )
     return IbkrSentimentBot(
         cfg=cfg,
@@ -348,4 +373,5 @@ def build_default_bot(
         execution=execution,
         db=db,
         ingestion=ingestion,
+        calendar=calendar,
     )

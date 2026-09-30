@@ -16,6 +16,10 @@ basket builder) and routes them to the broker. Respects:
   * Stale-order reconciliation — `cancel_stale_orders()` cancels any
     working order carrying our prefix (e.g. left over from a crash)
     so positions are read from a quiet book and nothing is re-sent.
+  * Order style — marketable LIMIT orders by default, priced at the
+    touch +/- `limit_offset_bps` from a fresh quote so no fill can be
+    worse than that; `adaptive` (IBKR Adaptive algo) and `market` are
+    opt-in. Emergency flattening always uses market orders.
   * `dry_run` mode — orders are logged, never sent.
   * IBKR pacing — the broker's own rate limiter is what we rely on; the
     engine does not double-count.
@@ -28,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from uuid import uuid4
 
 from src.ibkr_sentiment.broker.base import (
@@ -45,6 +49,10 @@ from src.ibkr_sentiment.signal_engine.dollar_neutral import (
     TargetPosition,
     diff_targets,
 )
+
+
+class NoQuoteError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -72,6 +80,8 @@ class ExecutionEngine:
     order_prefix: str = "ibsent"
     fill_timeout_s: float = 30.0
     cancel_confirm_timeout_s: float = 5.0
+    order_style: str = "limit"  # limit | adaptive | market
+    limit_offset_bps: Decimal = Decimal("10")
 
     async def enforce_account(
         self, account: AccountSummary, result: RunResult
@@ -125,7 +135,11 @@ class ExecutionEngine:
 
         submitted: list[tuple[TargetPosition, OrderResult]] = []
         for d in approved:
-            req = self._to_order_request(d)
+            try:
+                req = await self._to_order_request(d)
+            except NoQuoteError as e:
+                result.errors.append((d.symbol, str(e)))
+                continue
             if self.dry_run:
                 result.skipped_dry_run.append((d, req))
                 continue
@@ -196,15 +210,39 @@ class ExecutionEngine:
             *(self.broker.wait_for_fill(o, self.cancel_confirm_timeout_s) for o in stale)
         )
 
-    def _to_order_request(self, delta: TargetPosition) -> OrderRequest:
+    async def _to_order_request(self, delta: TargetPosition) -> OrderRequest:
         side = OrderSide.BUY if delta.target_qty > 0 else OrderSide.SELL
-        return OrderRequest(
+        req = OrderRequest(
             symbol=delta.symbol,
             side=side,
             qty=abs(delta.target_qty),
             order_type=OrderType.MARKET,
             client_order_id=f"{self.order_prefix}-{uuid4().hex[:10]}",
         )
+        if self.order_style == "adaptive":
+            req.algo = "Adaptive"
+        elif self.order_style == "limit":
+            req.order_type = OrderType.LIMIT
+            req.limit_price = await self._limit_price(delta.symbol, side)
+        return req
+
+    async def _limit_price(self, symbol: str, side: OrderSide) -> Decimal:
+        """Marketable limit: the far touch (ask to buy, bid to sell) moved
+        `limit_offset_bps` further, rounded to the tick inward so the
+        cap is never exceeded."""
+        q = await self.broker.quote(symbol)
+        ref = q.ask if side == OrderSide.BUY else q.bid
+        if ref <= 0:
+            ref = q.last
+        if ref <= 0:
+            raise NoQuoteError(f"{symbol}: no quote, limit order not sent")
+        offset = self.limit_offset_bps / Decimal("10000")
+        tick = Decimal("0.01") if ref >= 1 else Decimal("0.0001")
+        if side == OrderSide.BUY:
+            raw, rounding = ref * (1 + offset), ROUND_FLOOR
+        else:
+            raw, rounding = ref * (1 - offset), ROUND_CEILING
+        return (raw / tick).quantize(Decimal("1"), rounding=rounding) * tick
 
     async def emergency_flatten(self) -> list[OrderResult]:
         """Cancel open orders, then close all positions ignoring the
