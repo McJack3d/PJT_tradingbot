@@ -122,6 +122,9 @@ class SignalConfig(BaseModel):
     rsi_long_min: float = 35.0  # ignore long if RSI < this (oversold collapse)
     rsi_short_max: float = 65.0  # ignore short if RSI > this (squeeze risk)
     technical_confirm_required: bool = True
+    # Daily bars for the technicals are cached: full history once, then a
+    # small incremental refresh at most this often (and on each new day).
+    bars_refresh_minutes: int = 60
 
 
 class RiskOverlayConfig(BaseModel):

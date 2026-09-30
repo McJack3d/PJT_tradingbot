@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from src.ibkr_sentiment.bar_cache import BarCache
 from src.ibkr_sentiment.broker.base import AccountSummary, Broker
 from src.ibkr_sentiment.config import IbkrSentimentConfig
 from src.ibkr_sentiment.execution.engine import ExecutionEngine, RunResult
@@ -62,6 +63,14 @@ class IbkrSentimentBot:
     startup_reconciliation: RunResult | None = None
     # None disables the market-hours gate (tests, or 24h instruments).
     calendar: MarketCalendar | None = None
+    bar_cache: BarCache | None = None  # built from cfg when not supplied
+
+    def __post_init__(self) -> None:
+        if self.bar_cache is None:
+            self.bar_cache = BarCache(
+                broker=self.broker,
+                refresh=timedelta(minutes=self.cfg.signal.bars_refresh_minutes),
+            )
 
     # Items that arrived since the last tick. Flushed at the top of
     # `tick()`. Keeping a small buffer rather than firing inference on
@@ -222,9 +231,8 @@ class IbkrSentimentBot:
         snapshots: dict[str, TechnicalSnapshot] = {}
         for sig in signals:
             try:
-                bars = await self.broker.historical_bars(
-                    sig.symbol, duration="120 D", bar_size="1 day"
-                )
+                assert self.bar_cache is not None  # set in __post_init__
+                bars = await self.bar_cache.get(sig.symbol, now)
             except Exception:
                 bars = []
             closes = [float(b.close) for b in bars] if bars else []

@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+from src.ibkr_sentiment.bar_cache import bar_day
 from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
@@ -107,12 +108,6 @@ def _shortable_level(ticker: Any) -> Decimal | None:
     if value is None or math.isnan(float(value)) or float(value) <= 0:
         return None
     return Decimal(str(value))
-
-
-def _bar_day(ts: Any) -> date:
-    if isinstance(ts, datetime):
-        return trading_day(ts if ts.tzinfo else ts.replace(tzinfo=UTC))
-    return ts
 
 
 def _status_from_ib(status: str) -> OrderStatus:
@@ -360,7 +355,7 @@ class IbkrBroker(Broker):
             except Exception as e:
                 log.warning("ibkr.ssr.bars_error", symbol=symbol, error=str(e))
                 return False  # don't cache a failure
-            done = [b for b in bars if _bar_day(b.ts) < today]
+            done = [b for b in bars if bar_day(b.ts) < today]
             carried = len(done) >= 2 and ssr_triggered(
                 prev_close=done[-2].close, day_low=done[-1].low, last=None
             )
