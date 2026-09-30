@@ -111,4 +111,5 @@ risk:
   max_orders_per_minute: 20
 
 tick_seconds: 60
+fill_timeout_s: 30   # cancel any unfilled remainder after this many seconds
 db_url: sqlite+aiosqlite:///data/ibkr_sentiment.db

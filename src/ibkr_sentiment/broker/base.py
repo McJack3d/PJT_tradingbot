@@ -34,6 +34,10 @@ class OrderStatus(str, Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED)
+
 
 @dataclass(slots=True)
 class Quote:
@@ -100,6 +104,14 @@ class OrderResult:
     submitted_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+@dataclass(slots=True)
+class OpenOrderView:
+    client_order_id: str  # IBKR orderRef; "" for orders placed outside the bot
+    broker_order_id: str
+    symbol: str
+    remaining_qty: Decimal  # signed: + buy, - sell
+
+
 class Broker(ABC):
     @abstractmethod
     async def connect(self) -> None: ...
@@ -129,6 +141,20 @@ class Broker(ABC):
 
     @abstractmethod
     async def cancel_order(self, broker_order_id: str) -> None: ...
+
+    @abstractmethod
+    async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
+        """Wait until `order` reaches a terminal status or `timeout_s`
+        elapses; return the latest snapshot either way."""
+
+    @abstractmethod
+    async def order_status(self, client_order_id: str) -> OrderResult | None:
+        """Look up an order the broker still knows about by our
+        client order id. None if the broker has no record of it."""
+
+    @abstractmethod
+    async def open_orders(self) -> list[OpenOrderView]:
+        """Every working order on the account, ours or not."""
 
     @abstractmethod
     async def cancel_all_orders(self) -> None:

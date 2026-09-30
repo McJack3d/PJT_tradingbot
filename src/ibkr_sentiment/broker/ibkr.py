@@ -24,6 +24,7 @@ from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
     Broker,
+    OpenOrderView,
     OrderRequest,
     OrderResult,
     OrderStatus,
@@ -74,6 +75,21 @@ def _price(x: Any) -> Decimal | None:
     return Decimal(str(x))
 
 
+def _result_from_trade(trade: Any, *, fallback_client_id: str = "") -> OrderResult:
+    filled = _to_decimal(trade.orderStatus.filled)
+    status = _status_from_ib(trade.orderStatus.status)
+    # IB reports a partial fill as "Submitted" with filled > 0.
+    if filled > 0 and not status.is_terminal:
+        status = OrderStatus.PARTIALLY_FILLED
+    return OrderResult(
+        client_order_id=fallback_client_id or str(trade.order.orderId),
+        broker_order_id=str(trade.order.orderId),
+        status=status,
+        filled_qty=filled,
+        avg_fill_price=_price(trade.orderStatus.avgFillPrice) or Decimal("0"),
+    )
+
+
 def _status_from_ib(status: str) -> OrderStatus:
     s = (status or "").lower()
     if s in ("filled",):
@@ -96,6 +112,7 @@ def _status_from_ib(status: str) -> OrderStatus:
 class IbkrBroker(Broker):
     # Quote polling: up to 50 polls of 50ms each (overridable in tests).
     _quote_poll_s: float = 0.05
+    _fill_poll_s: float = 0.25
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -124,6 +141,7 @@ class IbkrBroker(Broker):
             ),
         )
         self._contract_cache: dict[str, Any] = {}
+        self._trades: dict[str, Any] = {}  # broker order id -> ib Trade
 
     # ---- lazy SDK import --------------------------------------------
 
@@ -338,17 +356,61 @@ class IbkrBroker(Broker):
             # but we set `orderRef` so the bot's own logs can join back.
             order.orderRef = req.client_order_id
         trade = self._ib.placeOrder(contract, order)
+        self._trades[str(trade.order.orderId)] = trade
         # Don't block until fill — return current snapshot. The
-        # execution engine has its own follow-up loop.
+        # execution engine follows up with `wait_for_fill`.
         await asyncio.sleep(0)
-        status = _status_from_ib(trade.orderStatus.status)
-        return OrderResult(
-            client_order_id=req.client_order_id or str(trade.order.orderId),
-            broker_order_id=str(trade.order.orderId),
-            status=status,
-            filled_qty=_to_decimal(trade.orderStatus.filled),
-            avg_fill_price=_to_decimal(trade.orderStatus.avgFillPrice),
-        )
+        return _result_from_trade(trade, fallback_client_id=req.client_order_id)
+
+    def _find_trade(self, broker_order_id: str | None):
+        assert self._ib is not None
+        if broker_order_id and broker_order_id in self._trades:
+            return self._trades[broker_order_id]
+        for trade in self._ib.trades():
+            if str(trade.order.orderId) == str(broker_order_id):
+                return trade
+        return None
+
+    async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
+        trade = self._find_trade(order.broker_order_id)
+        if trade is None:
+            return order
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            result = _result_from_trade(trade, fallback_client_id=order.client_order_id)
+            if result.status.is_terminal or loop.time() >= deadline:
+                result.submitted_at = order.submitted_at
+                return result
+            await asyncio.sleep(self._fill_poll_s)
+
+    async def order_status(self, client_order_id: str) -> OrderResult | None:
+        """Search this session's trades by orderRef. IBKR replays open
+        orders and today's completed orders on connect, so this covers a
+        restart within the same trading day."""
+        assert self._ib is not None
+        for trade in self._ib.trades():
+            if getattr(trade.order, "orderRef", "") == client_order_id:
+                return _result_from_trade(trade, fallback_client_id=client_order_id)
+        return None
+
+    async def open_orders(self) -> list[OpenOrderView]:
+        assert self._ib is not None
+        await self._limiter.acquire("generic")
+        out: list[OpenOrderView] = []
+        for trade in self._ib.openTrades():
+            remaining = _to_decimal(trade.orderStatus.remaining)
+            if trade.order.action == "SELL":
+                remaining = -remaining
+            out.append(
+                OpenOrderView(
+                    client_order_id=getattr(trade.order, "orderRef", "") or "",
+                    broker_order_id=str(trade.order.orderId),
+                    symbol=trade.contract.symbol,
+                    remaining_qty=remaining,
+                )
+            )
+        return out
 
     async def cancel_order(self, broker_order_id: str) -> None:
         assert self._ib is not None

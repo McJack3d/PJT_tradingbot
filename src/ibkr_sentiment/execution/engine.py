@@ -8,6 +8,14 @@ basket builder) and routes them to the broker. Respects:
   * Account halts — the first time the overlay trips, open orders are
     cancelled and every position is flattened; while the halt is
     latched nothing new is placed.
+  * Fill tracking — after placing a batch, waits (concurrently) for
+    every order to reach a terminal state; anything still working at
+    `fill_timeout_s` has its remainder cancelled. `RunResult.placed`
+    carries the FINAL state (filled qty / avg price), never the
+    submission snapshot.
+  * Stale-order reconciliation — `cancel_stale_orders()` cancels any
+    working order carrying our prefix (e.g. left over from a crash)
+    so positions are read from a quiet book and nothing is re-sent.
   * `dry_run` mode — orders are logged, never sent.
   * IBKR pacing — the broker's own rate limiter is what we rely on; the
     engine does not double-count.
@@ -18,6 +26,7 @@ and which positions were closed.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
 from uuid import uuid4
@@ -28,6 +37,7 @@ from src.ibkr_sentiment.broker.base import (
     OrderRequest,
     OrderResult,
     OrderSide,
+    OrderStatus,
     OrderType,
 )
 from src.ibkr_sentiment.risk.overlay import RiskOverlay, RiskVerdict
@@ -50,6 +60,8 @@ class RunResult:
     skipped_dry_run: list[tuple[TargetPosition, OrderRequest]] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
     flattened: list[OrderResult] = field(default_factory=list)
+    stale_cancelled: list[str] = field(default_factory=list)  # client order ids
+    foreign_open_orders: list[str] = field(default_factory=list)  # broker order ids
 
 
 @dataclass
@@ -58,6 +70,8 @@ class ExecutionEngine:
     overlay: RiskOverlay
     dry_run: bool = False
     order_prefix: str = "ibsent"
+    fill_timeout_s: float = 30.0
+    cancel_confirm_timeout_s: float = 5.0
 
     async def enforce_account(
         self, account: AccountSummary, result: RunResult
@@ -109,17 +123,78 @@ class ExecutionEngine:
                 continue
             approved.append(d)
 
+        submitted: list[tuple[TargetPosition, OrderResult]] = []
         for d in approved:
             req = self._to_order_request(d)
             if self.dry_run:
                 result.skipped_dry_run.append((d, req))
                 continue
             try:
-                res = await self.broker.place_order(req)
-                result.placed.append((d, res))
+                submitted.append((d, await self.broker.place_order(req)))
             except Exception as e:
                 result.errors.append((d.symbol, f"{type(e).__name__}: {e}"))
+
+        finals = await asyncio.gather(
+            *(self._await_final(d, res, result) for d, res in submitted)
+        )
+        result.placed.extend(zip((d for d, _ in submitted), finals, strict=True))
         return result
+
+    async def _await_final(
+        self, delta: TargetPosition, order: OrderResult, result: RunResult
+    ) -> OrderResult:
+        """Wait for a terminal state; on timeout cancel the remainder and
+        wait briefly for the cancel to confirm."""
+        try:
+            final = await self.broker.wait_for_fill(order, self.fill_timeout_s)
+            if final.status.is_terminal:
+                return final
+            if final.broker_order_id:
+                await self.broker.cancel_order(final.broker_order_id)
+            final = await self.broker.wait_for_fill(final, self.cancel_confirm_timeout_s)
+            if not final.status.is_terminal:
+                # Left for cancel_stale_orders() on the next tick.
+                result.errors.append(
+                    (delta.symbol, f"cancel unconfirmed for {final.client_order_id}")
+                )
+            return final
+        except Exception as e:
+            result.errors.append((delta.symbol, f"fill tracking {type(e).__name__}: {e}"))
+            return order
+
+    async def cancel_stale_orders(self, result: RunResult) -> None:
+        """Cancel our own working orders before reading positions.
+
+        Normally nothing survives a tick (`_await_final` cancels
+        remainders), so anything found here is left over from a crash or
+        an unconfirmed cancel. Orders placed outside the bot are
+        reported but never touched."""
+        if self.dry_run:
+            return
+        prefix = f"{self.order_prefix}-"
+        stale: list[OrderResult] = []
+        for o in await self.broker.open_orders():
+            if not o.client_order_id.startswith(prefix):
+                result.foreign_open_orders.append(o.broker_order_id)
+                continue
+            try:
+                await self.broker.cancel_order(o.broker_order_id)
+            except Exception as e:
+                result.errors.append((o.symbol, f"stale cancel {type(e).__name__}: {e}"))
+                continue
+            result.stale_cancelled.append(o.client_order_id)
+            stale.append(
+                OrderResult(
+                    client_order_id=o.client_order_id,
+                    broker_order_id=o.broker_order_id,
+                    status=OrderStatus.SUBMITTED,
+                    filled_qty=Decimal("0"),
+                    avg_fill_price=Decimal("0"),
+                )
+            )
+        await asyncio.gather(
+            *(self.broker.wait_for_fill(o, self.cancel_confirm_timeout_s) for o in stale)
+        )
 
     def _to_order_request(self, delta: TargetPosition) -> OrderRequest:
         side = OrderSide.BUY if delta.target_qty > 0 else OrderSide.SELL

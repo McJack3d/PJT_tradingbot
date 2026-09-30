@@ -58,6 +58,7 @@ class IbkrSentimentBot:
     execution: ExecutionEngine
     db: IbkrSentimentDB
     ingestion: IngestionService | None = None
+    startup_reconciliation: RunResult | None = None
 
     # Items that arrived since the last tick. Flushed at the top of
     # `tick()`. Keeping a small buffer rather than firing inference on
@@ -74,6 +75,7 @@ class IbkrSentimentBot:
         await self._restore_daily_anchor()
         if not await self.broker.is_connected():
             await self.broker.connect()
+        await self._reconcile_on_start()
         if self.ingestion is not None:
             await self.ingestion.start(self._on_item)
 
@@ -83,6 +85,35 @@ class IbkrSentimentBot:
         if await self.broker.is_connected():
             await self.broker.disconnect()
         await self.db.close()
+
+    async def _reconcile_on_start(self) -> RunResult:
+        """Bring DB and broker back in line after a restart.
+
+        1. Trades the DB last saw as working get their final state from
+           the broker (IBKR replays today's orders on connect).
+        2. Any of our orders still working at the broker are cancelled,
+           so the first tick plans from a quiet book instead of
+           re-sending orders that are already live.
+        """
+        report = RunResult()
+        for row in await self.db.open_trades():
+            try:
+                latest = await self.broker.order_status(row.client_order_id)
+            except Exception as e:
+                report.errors.append((row.symbol, f"order_status {type(e).__name__}: {e}"))
+                continue
+            if latest is not None:
+                await self.db.update_trade(latest)
+            else:
+                report.errors.append((row.symbol, f"unknown to broker: {row.client_order_id}"))
+        await self.execution.cancel_stale_orders(report)
+        # Stale orders may have filled before the cancel landed.
+        for cid in report.stale_cancelled:
+            latest = await self.broker.order_status(cid)
+            if latest is not None:
+                await self.db.update_trade(latest)
+        self.startup_reconciliation = report
+        return report
 
     async def _restore_daily_anchor(self, now: datetime | None = None) -> None:
         """Seed the daily loss-stop anchor from today's first equity
@@ -242,7 +273,10 @@ class IbkrSentimentBot:
             max_sector_pct=self.cfg.risk.max_sector_pct,
         )
 
-        # 8. Execute.
+        # 8. Execute. Cancel our own leftover working orders first so
+        #    positions are read from a quiet book.
+        pre = RunResult()
+        await self.execution.cancel_stale_orders(pre)
         positions = await self.broker.positions()
         current_positions = {p.symbol: p.qty for p in positions}
         result = await self.execution.execute_basket(
@@ -251,6 +285,9 @@ class IbkrSentimentBot:
             current_positions=current_positions,
             marks={p.symbol: p.mark_price for p in positions},
         )
+        result.stale_cancelled = pre.stale_cancelled
+        result.foreign_open_orders = pre.foreign_open_orders
+        result.errors = pre.errors + result.errors
 
         # 9. Persist the resulting trades.
         for delta, placed in result.placed:
@@ -300,7 +337,9 @@ def build_default_bot(
         overlay = RiskOverlay(
             cfg=cfg.risk, starting_equity=cfg.risk.starting_equity_usd
         )
-    execution = ExecutionEngine(broker=broker, overlay=overlay)
+    execution = ExecutionEngine(
+        broker=broker, overlay=overlay, fill_timeout_s=cfg.fill_timeout_s
+    )
     return IbkrSentimentBot(
         cfg=cfg,
         broker=broker,

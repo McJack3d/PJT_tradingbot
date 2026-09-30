@@ -112,6 +112,7 @@ def _build_bot(cfg: IbkrSentimentConfig, broker: Broker) -> IbkrSentimentBot:
         broker=broker,
         overlay=overlay,
         dry_run=cfg.mode == IbkrMode.DRY_RUN,
+        fill_timeout_s=cfg.fill_timeout_s,
     )
     universe_symbols = [u.symbol for u in cfg.universe]
     bot.ingestion = IngestionService(

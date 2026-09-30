@@ -148,6 +148,8 @@ class IbkrSentimentConfig(BaseModel):
     signal: SignalConfig = Field(default_factory=SignalConfig)
     risk: RiskOverlayConfig = Field(default_factory=RiskOverlayConfig)
     tick_seconds: int = 60  # main loop cadence
+    # Max wait for an order to fill before its remainder is cancelled.
+    fill_timeout_s: float = 30.0
     db_url: str = "sqlite+aiosqlite:///data/ibkr_sentiment.db"
 
     @field_validator("universe")

@@ -22,6 +22,7 @@ from src.ibkr_sentiment.broker.base import (
     AccountSummary,
     Bar,
     Broker,
+    OpenOrderView,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -157,6 +158,15 @@ class PaperBroker(Broker):
     async def cancel_all_orders(self) -> None:
         # Paper broker fills synchronously, so nothing is ever resting.
         pass
+
+    async def wait_for_fill(self, order: OrderResult, timeout_s: float) -> OrderResult:
+        return self._orders.get(order.client_order_id, order)
+
+    async def order_status(self, client_order_id: str) -> OrderResult | None:
+        return self._orders.get(client_order_id)
+
+    async def open_orders(self) -> list[OpenOrderView]:
+        return []
 
     def _apply_fill(self, symbol: str, signed_qty: Decimal, price: Decimal) -> None:
         cost = signed_qty * price
