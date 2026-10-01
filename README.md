@@ -1,6 +1,6 @@
 # trad-bot
 
-Two independent trading bots in one repository:
+Independent trading bots in one repository:
 
 1. **Binance funding-rate arbitrage bot** — delta-neutral cash-and-carry
    on Binance: long spot + short perp in equal notional, harvest funding
@@ -9,6 +9,9 @@ Two independent trading bots in one repository:
    Brokers driven by a two-stage sentiment funnel (FinBERT → LLM
    gatekeeper) with a dollar-neutral overlay. Specified in
    `docs/IBKR_SENTIMENT.md`.
+3. **Small-cap crypto sentiment bot** — long/flat low-cap Binance spot
+   pairs driven by the same FinBERT → LLM funnel applied to crypto news.
+   Paper-default research scaffold. Specified in `docs/CRYPTO_SENTIMENT.md`.
 
 The two bots share no runtime state and can be deployed independently.
 This README covers the Binance bot; the IBKR sentiment bot is

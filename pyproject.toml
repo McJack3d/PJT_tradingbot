@@ -77,6 +77,7 @@ trad-dry-run = "scripts.run_dry_run:main"
 trad-tax-export = "scripts.tax_export:main"
 trad-download-history = "scripts.download_history:main"
 ibkr-sentiment-bot = "src.ibkr_sentiment.main:cli"
+crypto-sentiment-bot = "scripts.run_crypto_sentiment:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
